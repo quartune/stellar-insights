@@ -1,3 +1,45 @@
+#[test]
+fn test_initialize_multiple_admins_and_permissions() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, SnapshotContract);
+    let client = SnapshotContractClient::new(&env, &contract_id);
+
+    let admin1 = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let admins = vec![admin1.clone(), admin2.clone()];
+    client.initialize(&admins);
+
+    let stored_admins = client.get_admins();
+    assert_eq!(stored_admins.len(), 2);
+    assert!(stored_admins.contains(&admin1));
+    assert!(stored_admins.contains(&admin2));
+
+    // Add a new admin
+    let admin3 = Address::generate(&env);
+    client.add_admin(&admin1, &admin3);
+    let stored_admins = client.get_admins();
+    assert_eq!(stored_admins.len(), 3);
+    assert!(stored_admins.contains(&admin3));
+
+    // Remove an admin
+    client.remove_admin(&admin2, &admin3);
+    let stored_admins = client.get_admins();
+    assert_eq!(stored_admins.len(), 2);
+    assert!(!stored_admins.contains(&admin3));
+
+    // Cannot remove last admin
+    client.remove_admin(&admin1, &admin2);
+    let stored_admins = client.get_admins();
+    assert_eq!(stored_admins.len(), 1);
+    assert!(stored_admins.contains(&admin1));
+    // Removing last admin should panic
+    let result = std::panic::catch_unwind(|| {
+        client.remove_admin(&admin1, &admin1);
+    });
+    assert!(result.is_err());
+}
 #![cfg(test)]
 
 use super::*;
@@ -331,7 +373,8 @@ fn test_get_latest_snapshot() {
 }
 
 #[test]
-fn test_latest_epoch_not_updated_for_older_epoch() {
+#[should_panic(expected = "Epoch monotonicity violated")]
+fn test_older_epoch_rejected() {
     let env = Env::default();
     let contract_id = env.register_contract(None, SnapshotContract);
     let client = SnapshotContractClient::new(&env, &contract_id);
@@ -344,11 +387,8 @@ fn test_latest_epoch_not_updated_for_older_epoch() {
     let latest = client.get_latest_snapshot().unwrap();
     assert_eq!(latest.epoch, 10u64);
 
-    // Submit snapshot at earlier epoch (should not update latest)
+    // Submit snapshot at earlier epoch (should panic - rollback attack prevented)
     client.submit_snapshot(&hash2, &5u64);
-    let latest = client.get_latest_snapshot().unwrap();
-    assert_eq!(latest.epoch, 10u64);
-    assert_eq!(latest.hash, hash1);
 }
 
 #[test]
