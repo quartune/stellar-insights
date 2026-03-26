@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -28,11 +29,11 @@ const MOCK_LATEST_LEDGER: u64 = 51_565_820;
 const ABSOLUTE_MAX_RECORDS_PER_REQUEST: u32 = 500;
 /// Default records per RPC request
 const DEFAULT_MAX_RECORDS_PER_REQUEST: u32 = 200;
-/// Absolute maximum total records across all paginated requests (DoS protection)
+/// Absolute maximum total records across all paginated requests (`DoS` protection)
 const ABSOLUTE_MAX_TOTAL_RECORDS: u32 = 5000;
 /// Default total records limit for pagination
 const DEFAULT_MAX_TOTAL_RECORDS: u32 = 1000;
-/// Minimum delay between pagination requests (DoS protection)
+/// Minimum delay between pagination requests (`DoS` protection)
 const MIN_PAGINATION_DELAY_MS: u64 = 50;
 /// Default delay between pagination requests
 const DEFAULT_PAGINATION_DELAY_MS: u64 = 100;
@@ -148,7 +149,7 @@ pub struct LedgerInfo {
 ///
 /// The new Horizon response for Soroban-compatible payments includes an
 /// `asset_balance_changes` array instead of top-level destination / amount /
-/// asset_code fields.  Each entry describes one leg of a transfer.
+/// `asset_code` fields.  Each entry describes one leg of a transfer.
 ///
 /// Example JSON:
 /// ```json
@@ -164,7 +165,7 @@ pub struct LedgerInfo {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetBalanceChange {
-    /// The Stellar asset type (native, credit_alphanum4, credit_alphanum12)
+    /// The Stellar asset type (native, `credit_alphanum4`, `credit_alphanum12`)
     pub asset_type: String,
     /// Asset code – `None` for native XLM
     pub asset_code: Option<String>,
@@ -216,6 +217,7 @@ pub struct Payment {
 impl Payment {
     /// Returns the destination account, checking the new `asset_balance_changes`
     /// format first, then falling back to the legacy `destination` / `to` fields.
+    #[must_use]
     pub fn get_destination(&self) -> Option<String> {
         if let Some(ref changes) = self.asset_balance_changes {
             if let Some(change) = changes.first() {
@@ -231,6 +233,7 @@ impl Payment {
     }
 
     /// Returns the transfer amount, preferring `asset_balance_changes`.
+    #[must_use]
     pub fn get_amount(&self) -> String {
         if let Some(ref changes) = self.asset_balance_changes {
             if let Some(change) = changes.first() {
@@ -241,6 +244,7 @@ impl Payment {
     }
 
     /// Returns the asset code, preferring `asset_balance_changes`.
+    #[must_use]
     pub fn get_asset_code(&self) -> Option<String> {
         if let Some(ref changes) = self.asset_balance_changes {
             if let Some(change) = changes.first() {
@@ -251,6 +255,7 @@ impl Payment {
     }
 
     /// Returns the asset issuer, preferring `asset_balance_changes`.
+    #[must_use]
     pub fn get_asset_issuer(&self) -> Option<String> {
         if let Some(ref changes) = self.asset_balance_changes {
             if let Some(change) = changes.first() {
@@ -476,7 +481,7 @@ impl StellarRpcClient {
     /// Create a new Stellar RPC client
     ///
     /// # Arguments
-    /// * `rpc_url` - The Stellar RPC endpoint URL (e.g., OnFinality)
+    /// * `rpc_url` - The Stellar RPC endpoint URL (e.g., `OnFinality`)
     /// * `horizon_url` - The Horizon API endpoint URL
     /// * `mock_mode` - If true, returns mock data instead of making real API calls
     pub fn new(rpc_url: String, horizon_url: String, mock_mode: bool) -> Self {
@@ -519,8 +524,9 @@ impl StellarRpcClient {
             .unwrap_or(DEFAULT_MAX_TOTAL_RECORDS)
             .min(ABSOLUTE_MAX_TOTAL_RECORDS);
 
-        if std::env::var("RPC_MAX_TOTAL_RECORDS").is_ok() 
-            && max_total_records > ABSOLUTE_MAX_TOTAL_RECORDS {
+        if std::env::var("RPC_MAX_TOTAL_RECORDS").is_ok()
+            && max_total_records > ABSOLUTE_MAX_TOTAL_RECORDS
+        {
             warn!(
                 "RPC_MAX_TOTAL_RECORDS ({}) exceeds maximum ({}), capping to {} (DoS protection)",
                 std::env::var("RPC_MAX_TOTAL_RECORDS").unwrap_or_default(),
@@ -535,8 +541,9 @@ impl StellarRpcClient {
             .unwrap_or(DEFAULT_PAGINATION_DELAY_MS)
             .max(MIN_PAGINATION_DELAY_MS);
 
-        if std::env::var("RPC_PAGINATION_DELAY_MS").is_ok() 
-            && pagination_delay_ms < MIN_PAGINATION_DELAY_MS {
+        if std::env::var("RPC_PAGINATION_DELAY_MS").is_ok()
+            && pagination_delay_ms < MIN_PAGINATION_DELAY_MS
+        {
             warn!(
                 "RPC_PAGINATION_DELAY_MS ({}) is below minimum ({}), using minimum",
                 std::env::var("RPC_PAGINATION_DELAY_MS").unwrap_or_default(),
@@ -567,6 +574,7 @@ impl StellarRpcClient {
     }
 
     /// Create a new client with network configuration
+    #[must_use]
     pub fn new_with_network(network: StellarNetwork, mock_mode: bool) -> Self {
         let network_config = NetworkConfig::for_network(network);
 
@@ -614,32 +622,38 @@ impl StellarRpcClient {
         }
     }
 
-    /// Create a new client with default OnFinality RPC and Horizon URLs (mainnet)
+    /// Create a new client with default `OnFinality` RPC and Horizon URLs (mainnet)
+    #[must_use]
     pub fn new_with_defaults(mock_mode: bool) -> Self {
         Self::new_with_network(StellarNetwork::Mainnet, mock_mode)
     }
 
     /// Get the current network configuration
-    pub fn network_config(&self) -> &NetworkConfig {
+    #[must_use]
+    pub const fn network_config(&self) -> &NetworkConfig {
         &self.network_config
     }
 
     /// Get the current network
-    pub fn network(&self) -> StellarNetwork {
+    #[must_use]
+    pub const fn network(&self) -> StellarNetwork {
         self.network_config.network
     }
 
     /// Check if this client is connected to mainnet
+    #[must_use]
     pub fn is_mainnet(&self) -> bool {
         self.network_config.is_mainnet()
     }
 
     /// Check if this client is connected to testnet
+    #[must_use]
     pub fn is_testnet(&self) -> bool {
         self.network_config.is_testnet()
     }
 
     /// Snapshot current outbound RPC/Horizon rate limiter metrics.
+    #[must_use]
     pub fn rate_limit_metrics(&self) -> RpcRateLimitMetrics {
         self.rate_limiter.metrics()
     }
@@ -670,9 +684,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.check_health_internal())
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -722,9 +735,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_latest_ledger_internal())
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -758,10 +770,10 @@ impl StellarRpcClient {
     ) -> Result<GetLedgersResult, RpcError> {
         if self.mock_mode {
             let start = if let Some(c) = cursor {
-                c.parse::<u64>()
-                    .ok()
-                    .map(|v| v.saturating_add(1))
-                    .unwrap_or_else(|| start_ledger.unwrap_or(MOCK_OLDEST_LEDGER))
+                c.parse::<u64>().ok().map_or_else(
+                    || start_ledger.unwrap_or(MOCK_OLDEST_LEDGER),
+                    |v| v.saturating_add(1),
+                )
             } else {
                 start_ledger.unwrap_or(MOCK_OLDEST_LEDGER)
             };
@@ -772,9 +784,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_ledgers_internal(start_ledger, limit, cursor))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -843,9 +854,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_payments_internal(limit, cursor))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -856,7 +866,7 @@ impl StellarRpcClient {
     ) -> Result<Vec<Payment>, RpcError> {
         let mut url = format!("{}/payments?order=desc&limit={}", self.horizon_url, limit);
         if let Some(c) = cursor {
-            url.push_str(&format!("&cursor={}", c));
+            write!(url, "&cursor={c}").unwrap();
         }
         let response = self
             .client
@@ -891,9 +901,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_trades_internal(limit, cursor))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -904,7 +913,7 @@ impl StellarRpcClient {
     ) -> Result<Vec<Trade>, RpcError> {
         let mut url = format!("{}/trades?order=desc&limit={}", self.horizon_url, limit);
         if let Some(c) = cursor {
-            url.push_str(&format!("&cursor={}", c));
+            write!(url, "&cursor={c}").unwrap();
         }
         let response = self
             .client
@@ -942,9 +951,8 @@ impl StellarRpcClient {
             })
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -986,9 +994,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_payments_for_ledger_internal(sequence))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -1032,9 +1039,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_transactions_for_ledger_internal(sequence))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -1078,9 +1084,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_operations_for_ledger_internal(sequence))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -1124,9 +1129,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_operation_effects_internal(operation_id))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -1171,9 +1175,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_account_payments_internal(account_id, limit))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -1209,7 +1212,7 @@ impl StellarRpcClient {
     // Paginated Fetch Methods
     // ============================================================================
 
-    /// Fetch all payments with automatic pagination up to max_total_records
+    /// Fetch all payments with automatic pagination up to `max_total_records`
     ///
     /// # Arguments
     /// * `max_records` - Optional maximum number of records to fetch (uses config default if None)
@@ -1218,11 +1221,15 @@ impl StellarRpcClient {
     /// Vector of all fetched payments up to the limit
     pub async fn fetch_all_payments(&self, max_records: Option<u32>) -> Result<Vec<Payment>> {
         if self.mock_mode {
-            let limit = max_records.unwrap_or(self.max_total_records).min(ABSOLUTE_MAX_TOTAL_RECORDS);
+            let limit = max_records
+                .unwrap_or(self.max_total_records)
+                .min(ABSOLUTE_MAX_TOTAL_RECORDS);
             return Ok(Self::mock_payments(limit));
         }
 
-        let max_records = max_records.unwrap_or(self.max_total_records).min(ABSOLUTE_MAX_TOTAL_RECORDS);
+        let max_records = max_records
+            .unwrap_or(self.max_total_records)
+            .min(ABSOLUTE_MAX_TOTAL_RECORDS);
         let mut all_payments = Vec::new();
         let mut cursor: Option<String> = None;
         let mut fetched = 0;
@@ -1277,7 +1284,7 @@ impl StellarRpcClient {
         Ok(all_payments)
     }
 
-    /// Fetch all trades with automatic pagination up to max_total_records
+    /// Fetch all trades with automatic pagination up to `max_total_records`
     ///
     /// # Arguments
     /// * `max_records` - Optional maximum number of records to fetch (uses config default if None)
@@ -1286,11 +1293,15 @@ impl StellarRpcClient {
     /// Vector of all fetched trades up to the limit
     pub async fn fetch_all_trades(&self, max_records: Option<u32>) -> Result<Vec<Trade>> {
         if self.mock_mode {
-            let limit = max_records.unwrap_or(self.max_total_records).min(ABSOLUTE_MAX_TOTAL_RECORDS);
+            let limit = max_records
+                .unwrap_or(self.max_total_records)
+                .min(ABSOLUTE_MAX_TOTAL_RECORDS);
             return Ok(Self::mock_trades(limit));
         }
 
-        let max_records = max_records.unwrap_or(self.max_total_records).min(ABSOLUTE_MAX_TOTAL_RECORDS);
+        let max_records = max_records
+            .unwrap_or(self.max_total_records)
+            .min(ABSOLUTE_MAX_TOTAL_RECORDS);
         let mut all_trades = Vec::new();
         let mut cursor: Option<String> = None;
         let mut fetched = 0;
@@ -1361,11 +1372,15 @@ impl StellarRpcClient {
         max_records: Option<u32>,
     ) -> Result<Vec<Payment>> {
         if self.mock_mode {
-            let limit = max_records.unwrap_or(self.max_total_records).min(ABSOLUTE_MAX_TOTAL_RECORDS);
+            let limit = max_records
+                .unwrap_or(self.max_total_records)
+                .min(ABSOLUTE_MAX_TOTAL_RECORDS);
             return Ok(Self::mock_payments(limit));
         }
 
-        let max_records = max_records.unwrap_or(self.max_total_records).min(ABSOLUTE_MAX_TOTAL_RECORDS);
+        let max_records = max_records
+            .unwrap_or(self.max_total_records)
+            .min(ABSOLUTE_MAX_TOTAL_RECORDS);
         let mut all_payments = Vec::new();
         let mut cursor: Option<String> = None;
         let mut fetched = 0;
@@ -1384,7 +1399,7 @@ impl StellarRpcClient {
             );
 
             if let Some(ref cursor_val) = cursor {
-                url.push_str(&format!("&cursor={}", cursor_val));
+                write!(url, "&cursor={cursor_val}").unwrap();
             }
 
             let response = self
@@ -1447,7 +1462,7 @@ impl StellarRpcClient {
     /// Convert asset to query parameters for Horizon API
     fn asset_to_query_params(prefix: &str, asset: &Asset) -> Result<String> {
         if asset.asset_type == "native" {
-            Ok(format!("{}_asset_type=native", prefix))
+            Ok(format!("{prefix}_asset_type=native"))
         } else {
             let asset_code = asset.asset_code.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1517,7 +1532,7 @@ impl StellarRpcClient {
                     status, elapsed, error_text
                 );
 
-                let msg = format!("HTTP {}: {}", status, error_text);
+                let msg = format!("HTTP {status}: {error_text}");
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     let retry_after = headers
                         .get("Retry-After")
@@ -1544,7 +1559,7 @@ impl StellarRpcClient {
         .await
         .map_err(|e| {
             info!("Request failed after retry/circuit-breaker checks: {}", e);
-            anyhow!("Request failed: {}", e)
+            anyhow!("Request failed: {e}")
         })
     }
 
@@ -1587,11 +1602,12 @@ impl StellarRpcClient {
             };
         }
 
-        let end = (start.saturating_add(limit as u64).saturating_sub(1)).min(MOCK_LATEST_LEDGER);
+        let end =
+            (start.saturating_add(u64::from(limit)).saturating_sub(1)).min(MOCK_LATEST_LEDGER);
         let ledgers = (start..=end)
             .enumerate()
             .map(|(i, seq)| RpcLedger {
-                hash: format!("hash_{}", seq),
+                hash: format!("hash_{seq}"),
                 sequence: seq,
                 ledger_close_time: format!("{}", 1734032457 + i as u64 * 5),
                 header_xdr: Some("mock_header".to_string()),
@@ -1618,9 +1634,9 @@ impl StellarRpcClient {
                 let use_new_format = i % 2 == 0;
 
                 let dest_account =
-                    format!("GDYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY{:03}", i);
+                    format!("GDYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY{i:03}");
                 let src_account =
-                    format!("GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX{:03}", i);
+                    format!("GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX{i:03}");
                 let asset_type_str = if is_native_dest {
                     "native".to_string()
                 } else if i % 2 == 0 {
@@ -1646,9 +1662,9 @@ impl StellarRpcClient {
                 let amount_str = format!("{}.0000000", 100 + i * 10);
 
                 Payment {
-                    id: format!("payment_{}", i),
-                    paging_token: format!("paging_{}", i),
-                    transaction_hash: format!("txhash_{}", i),
+                    id: format!("payment_{i}"),
+                    paging_token: format!("paging_{i}"),
+                    transaction_hash: format!("txhash_{i}"),
                     source_account: src_account.clone(),
                     // When the new format is used the top-level destination may
                     // be empty, just like the real Horizon response.
@@ -1721,8 +1737,7 @@ impl StellarRpcClient {
                             asset_issuer: asset_issuer_val,
                             change_type: "transfer".to_string(),
                             from: Some(format!(
-                                "GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX{:03}",
-                                i
+                                "GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX{i:03}"
                             )),
                             to: Some(dest_account),
                             amount: amount_str,
@@ -1738,17 +1753,14 @@ impl StellarRpcClient {
     fn mock_trades(limit: u32) -> Vec<Trade> {
         (0..limit)
             .map(|i| Trade {
-                id: format!("trade_{}", i),
+                id: format!("trade_{i}"),
                 ledger_close_time: format!("2026-01-22T10:{:02}:00Z", i % 60),
-                base_account: format!("GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX{:03}", i),
+                base_account: format!("GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX{i:03}"),
                 base_amount: format!("{}.0000000", 1000 + i * 100),
                 base_asset_type: "native".to_string(),
                 base_asset_code: None,
                 base_asset_issuer: None,
-                counter_account: format!(
-                    "GDYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY{:03}",
-                    i
-                ),
+                counter_account: format!("GDYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY{i:03}"),
                 counter_amount: format!("{}.0000000", 500 + i * 50),
                 counter_asset_type: "credit_alphanum4".to_string(),
                 counter_asset_code: Some("USDC".to_string()),
@@ -1756,7 +1768,7 @@ impl StellarRpcClient {
                     "GBXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX".to_string(),
                 ),
                 price: Price {
-                    n: 2 + i as i64,
+                    n: 2 + i64::from(i),
                     d: 1,
                 },
                 trade_type: "orderbook".to_string(),
@@ -1814,8 +1826,8 @@ impl StellarRpcClient {
             .map(|i| {
                 let is_fee_bump = i % 2 == 0;
                 HorizonTransaction {
-                    id: format!("tx_{}", i),
-                    hash: format!("txhash_{}", i),
+                    id: format!("tx_{i}"),
+                    hash: format!("txhash_{i}"),
                     ledger: ledger_sequence,
                     created_at: "2026-01-22T10:30:00Z".to_string(),
                     source_account: "GXX".to_string(),
@@ -1824,10 +1836,10 @@ impl StellarRpcClient {
                     max_fee: Some("1000".to_string()),
                     operation_count: 1,
                     successful: true,
-                    paging_token: format!("pt_{}", i),
+                    paging_token: format!("pt_{i}"),
                     fee_bump_transaction: if is_fee_bump {
                         Some(FeeBumpTransactionInfo {
-                            hash: format!("fb_hash_{}", i),
+                            hash: format!("fb_hash_{i}"),
                             signatures: vec!["sig1".to_string()],
                         })
                     } else {
@@ -1835,7 +1847,7 @@ impl StellarRpcClient {
                     },
                     inner_transaction: if is_fee_bump {
                         Some(InnerTransaction {
-                            hash: format!("inner_hash_{}", i),
+                            hash: format!("inner_hash_{i}"),
                             max_fee: Some("500".to_string()),
                             signatures: vec!["sig1".to_string()],
                         })
@@ -1855,9 +1867,9 @@ impl StellarRpcClient {
 
         vec![
             HorizonOperation {
-                id: format!("op_{}_0", sequence),
-                paging_token: format!("pt_{}_0", sequence),
-                transaction_hash: format!("txhash_{}_0", sequence),
+                id: format!("op_{sequence}_0"),
+                paging_token: format!("pt_{sequence}_0"),
+                transaction_hash: format!("txhash_{sequence}_0"),
                 source_account: source_a.clone(),
                 operation_type: "account_merge".to_string(),
                 created_at: "2026-01-22T10:30:00Z".to_string(),
@@ -1866,9 +1878,9 @@ impl StellarRpcClient {
                 amount: None,
             },
             HorizonOperation {
-                id: format!("op_{}_1", sequence),
-                paging_token: format!("pt_{}_1", sequence),
-                transaction_hash: format!("txhash_{}_1", sequence),
+                id: format!("op_{sequence}_1"),
+                paging_token: format!("pt_{sequence}_1"),
+                transaction_hash: format!("txhash_{sequence}_1"),
                 source_account: "GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
                     .to_string(),
                 operation_type: "payment".to_string(),
@@ -1878,9 +1890,9 @@ impl StellarRpcClient {
                 amount: Some("25.0000000".to_string()),
             },
             HorizonOperation {
-                id: format!("op_{}_2", sequence),
-                paging_token: format!("pt_{}_2", sequence),
-                transaction_hash: format!("txhash_{}_2", sequence),
+                id: format!("op_{sequence}_2"),
+                paging_token: format!("pt_{sequence}_2"),
+                transaction_hash: format!("txhash_{sequence}_2"),
                 source_account: source_b.clone(),
                 operation_type: "account_merge".to_string(),
                 created_at: "2026-01-22T10:32:00Z".to_string(),
@@ -1894,7 +1906,7 @@ impl StellarRpcClient {
     fn mock_effects_for_operation(operation_id: &str) -> Vec<HorizonEffect> {
         if operation_id.ends_with("_0") {
             return vec![HorizonEffect {
-                id: format!("effect_{}_0", operation_id),
+                id: format!("effect_{operation_id}_0"),
                 effect_type: "account_credited".to_string(),
                 account: Some(
                     "GDESTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
@@ -1907,7 +1919,7 @@ impl StellarRpcClient {
         if operation_id.ends_with("_2") {
             return vec![
                 HorizonEffect {
-                    id: format!("effect_{}_0", operation_id),
+                    id: format!("effect_{operation_id}_0"),
                     effect_type: "account_credited".to_string(),
                     account: Some(
                         "GDESTBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string(),
@@ -1916,7 +1928,7 @@ impl StellarRpcClient {
                     asset_type: Some("native".to_string()),
                 },
                 HorizonEffect {
-                    id: format!("effect_{}_1", operation_id),
+                    id: format!("effect_{operation_id}_1"),
                     effect_type: "account_credited".to_string(),
                     account: Some(
                         "GDESTBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string(),
@@ -1948,9 +1960,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_liquidity_pools_internal(limit, cursor))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -1964,7 +1975,7 @@ impl StellarRpcClient {
             self.horizon_url, limit
         );
         if let Some(c) = cursor {
-            url.push_str(&format!("&cursor={}", c));
+            write!(url, "&cursor={c}").unwrap();
         }
         let response = self
             .client
@@ -2001,9 +2012,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_liquidity_pool_internal(pool_id))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -2041,9 +2051,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_pool_trades_internal(pool_id, limit))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -2089,9 +2098,8 @@ impl StellarRpcClient {
             .execute_with_retry(|| self.fetch_assets_internal(limit, rating_sort))
             .await;
 
-        result.map_err(|e| {
+        result.inspect_err(|e| {
             metrics::record_rpc_error(e.error_type_label(), "stellar");
-            e
         })
     }
 
@@ -2187,12 +2195,12 @@ impl StellarRpcClient {
                     let asset_a = if issuer_a.is_empty() {
                         "native".to_string()
                     } else {
-                        format!("{}:{}", code_a, issuer_a)
+                        format!("{code_a}:{issuer_a}")
                     };
                     let asset_b = if issuer_b.is_empty() {
                         "native".to_string()
                     } else {
-                        format!("{}:{}", code_b, issuer_b)
+                        format!("{code_b}:{issuer_b}")
                     };
 
                     HorizonLiquidityPool {
@@ -2200,18 +2208,18 @@ impl StellarRpcClient {
                         fee_bp: 30,
                         pool_type: "constant_product".to_string(),
                         total_trustlines: 100 + (i as u64 * 50),
-                        total_shares: shares.to_string(),
+                        total_shares: (*shares).to_string(),
                         reserves: vec![
                             HorizonPoolReserve {
                                 asset: asset_a,
-                                amount: amt_a.to_string(),
+                                amount: (*amt_a).to_string(),
                             },
                             HorizonPoolReserve {
                                 asset: asset_b,
-                                amount: amt_b.to_string(),
+                                amount: (*amt_b).to_string(),
                             },
                         ],
-                        paging_token: Some(format!("pt_pool_{}", i)),
+                        paging_token: Some(format!("pt_pool_{i}")),
                     }
                 },
             )
@@ -2220,7 +2228,7 @@ impl StellarRpcClient {
 
     fn mock_assets(limit: u32) -> Vec<HorizonAsset> {
         let mut assets = Vec::new();
-        let issues = vec![
+        let issues = [
             (
                 "USDC",
                 "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
@@ -2243,8 +2251,8 @@ impl StellarRpcClient {
             let base_trustlines = 10000 - (i as i32 * 2000);
             assets.push(HorizonAsset {
                 asset_type: "credit_alphanum4".to_string(),
-                asset_code: code.to_string(),
-                asset_issuer: issuer.to_string(),
+                asset_code: (*code).to_string(),
+                asset_issuer: (*issuer).to_string(),
                 num_claimable_balances: 0,
                 num_liquidity_pools: 0,
                 num_contracts: 0,
@@ -2267,9 +2275,25 @@ impl StellarRpcClient {
                     auth_immutable: false,
                     auth_clawback_enabled: false,
                 },
-            })
+            });
         }
         assets
+    }
+
+    /// Fetch anchor metrics from RPC
+    pub async fn fetch_anchor_metrics(
+        &self,
+        _anchor_id: Uuid,
+    ) -> Result<crate::api::anchors::AnchorMetrics, RpcError> {
+        // TODO: Implement actual RPC call to fetch anchor metrics
+        // For now, return mock data
+        Ok(crate::api::anchors::AnchorMetrics {
+            anchor_id: _anchor_id,
+            total_payments: 1000,
+            successful_payments: 950,
+            failed_payments: 50,
+            total_volume: 1000000.0,
+        })
     }
 }
 
@@ -2406,7 +2430,10 @@ mod tests {
         let client = StellarRpcClient::new_with_defaults(true);
 
         // Verify default pagination config is loaded with security limits
-        assert_eq!(client.max_records_per_request, DEFAULT_MAX_RECORDS_PER_REQUEST);
+        assert_eq!(
+            client.max_records_per_request,
+            DEFAULT_MAX_RECORDS_PER_REQUEST
+        );
         assert_eq!(client.max_total_records, DEFAULT_MAX_TOTAL_RECORDS);
         assert_eq!(client.pagination_delay_ms, DEFAULT_PAGINATION_DELAY_MS);
     }

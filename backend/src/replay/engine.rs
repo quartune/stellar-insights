@@ -16,7 +16,7 @@ use super::{
     event_processor::{CompositeEventProcessor, ProcessingContext},
     state_builder::StateBuilder,
     storage::{EventStorage, ReplayStorage},
-    ContractEvent, EventFilter, ReplayError, ReplayMetadata, ReplayResult, ReplayStatus,
+    ContractEvent, ReplayError, ReplayMetadata, ReplayResult, ReplayStatus,
 };
 
 /// Main replay engine
@@ -41,7 +41,9 @@ impl ReplayEngine {
         state_builder: Arc<RwLock<StateBuilder>>,
     ) -> Result<Self> {
         // Validate configuration
-        config.validate().map_err(|e| ReplayError::ConfigError(e))?;
+        config
+            .validate()
+            .map_err(|e| ReplayError::ConfigError(e.to_string()))?;
 
         let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -77,7 +79,7 @@ impl ReplayEngine {
         self.replay_storage
             .save_metadata(&metadata)
             .await
-            .map_err(|e| ReplayError::StorageError(e))?;
+            .map_err(ReplayError::StorageError)?;
 
         // Determine start and end ledgers
         let (start_ledger, end_ledger) = self.determine_ledger_range().await?;
@@ -93,7 +95,7 @@ impl ReplayEngine {
         self.replay_storage
             .save_metadata(&metadata)
             .await
-            .map_err(|e| ReplayError::StorageError(e))?;
+            .map_err(ReplayError::StorageError)?;
 
         // Execute replay
         let start_time = Instant::now();
@@ -129,7 +131,7 @@ impl ReplayEngine {
         self.replay_storage
             .save_metadata(&metadata)
             .await
-            .map_err(|e| ReplayError::StorageError(e))?;
+            .map_err(ReplayError::StorageError)?;
 
         Ok(metadata)
     }
@@ -207,7 +209,7 @@ impl ReplayEngine {
             };
 
             // Checkpoint if needed
-            if current_ledger % self.config.checkpoint_interval == 0 {
+            if current_ledger.is_multiple_of(self.config.checkpoint_interval) {
                 self.create_checkpoint(current_ledger, total_processed, total_failed, metadata)
                     .await?;
             }

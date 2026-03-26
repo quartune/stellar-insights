@@ -7,12 +7,15 @@ pub enum AlertType {
     SuccessRateDrop,
     LatencyIncrease,
     LiquidityDecrease,
+    AnchorStatusChange,
+    AnchorMetricChange,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Alert {
     pub alert_type: AlertType,
-    pub corridor_id: String,
+    pub corridor_id: Option<String>,
+    pub anchor_id: Option<String>,
     pub message: String,
     pub old_value: f64,
     pub new_value: f64,
@@ -21,12 +24,34 @@ pub struct Alert {
 
 pub struct AlertManager {
     tx: broadcast::Sender<Alert>,
+    webhook_event_service: Option<Arc<crate::services::webhook_event_service::WebhookEventService>>,
 }
 
 impl AlertManager {
+    #[must_use]
     pub fn new() -> (Self, broadcast::Receiver<Alert>) {
         let (tx, rx) = broadcast::channel(100);
-        (Self { tx }, rx)
+        (
+            Self {
+                tx,
+                webhook_event_service: None,
+            },
+            rx,
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_webhooks(
+        webhook_event_service: Arc<crate::services::webhook_event_service::WebhookEventService>,
+    ) -> (Self, broadcast::Receiver<Alert>) {
+        let (tx, rx) = broadcast::channel(100);
+        (
+            Self {
+                tx,
+                webhook_event_service: Some(webhook_event_service),
+            },
+            rx,
+        )
     }
 
     pub fn check_and_alert(
@@ -42,10 +67,10 @@ impl AlertManager {
         if new_success < old_success - 10.0 {
             let _ = self.tx.send(Alert {
                 alert_type: AlertType::SuccessRateDrop,
-                corridor_id: corridor_id.to_string(),
+                corridor_id: Some(corridor_id.to_string()),
+                anchor_id: None,
                 message: format!(
-                    "Success rate dropped from {:.1}% to {:.1}%",
-                    old_success, new_success
+                    "Success rate dropped from {old_success:.1}% to {new_success:.1}%"
                 ),
                 old_value: old_success,
                 new_value: new_success,
@@ -56,11 +81,9 @@ impl AlertManager {
         if new_latency > old_latency * 1.5 {
             let _ = self.tx.send(Alert {
                 alert_type: AlertType::LatencyIncrease,
-                corridor_id: corridor_id.to_string(),
-                message: format!(
-                    "Latency increased from {:.0}ms to {:.0}ms",
-                    old_latency, new_latency
-                ),
+                corridor_id: Some(corridor_id.to_string()),
+                anchor_id: None,
+                message: format!("Latency increased from {old_latency:.0}ms to {new_latency:.0}ms"),
                 old_value: old_latency,
                 new_value: new_latency,
                 timestamp: chrono::Utc::now().to_rfc3339(),
@@ -70,10 +93,10 @@ impl AlertManager {
         if new_liquidity < old_liquidity * 0.7 {
             let _ = self.tx.send(Alert {
                 alert_type: AlertType::LiquidityDecrease,
-                corridor_id: corridor_id.to_string(),
+                corridor_id: Some(corridor_id.to_string()),
+                anchor_id: None,
                 message: format!(
-                    "Liquidity decreased from ${:.0} to ${:.0}",
-                    old_liquidity, new_liquidity
+                    "Liquidity decreased from ${old_liquidity:.0} to ${new_liquidity:.0}"
                 ),
                 old_value: old_liquidity,
                 new_value: new_liquidity,
@@ -82,7 +105,61 @@ impl AlertManager {
         }
     }
 
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Alert> {
         self.tx.subscribe()
+    }
+
+    pub fn send_anchor_alert(
+        &self,
+        alert_type: AlertType,
+        anchor_id: &str,
+        message: String,
+        old_value: f64,
+        new_value: f64,
+    ) {
+        let alert = Alert {
+            alert_type,
+            corridor_id: None,
+            anchor_id: Some(anchor_id.to_string()),
+            message: message.clone(),
+            old_value,
+            new_value,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let _ = self.tx.send(alert);
+
+        // Trigger webhook event for anchor status change
+        if let Some(webhook_service) = &self.webhook_event_service {
+            let old_status = if old_value > 90.0 {
+                "healthy"
+            } else {
+                "degraded"
+            };
+            let new_status = if new_value > 90.0 {
+                "healthy"
+            } else {
+                "degraded"
+            };
+
+            tokio::spawn({
+                let webhook_service = webhook_service.clone();
+                let anchor_id = anchor_id.to_string();
+                let message_clone = message;
+                async move {
+                    if let Err(e) = webhook_service
+                        .trigger_anchor_status_changed(
+                            &anchor_id, &anchor_id, // Using anchor_id as name for now
+                            old_status, new_status, new_value,
+                            0, // failed_txn_count - would need to be tracked separately
+                        )
+                        .await
+                    {
+                        tracing::error!("Failed to trigger anchor status webhook: {}", e);
+                    }
+                }
+            });
+        }
     }
 }

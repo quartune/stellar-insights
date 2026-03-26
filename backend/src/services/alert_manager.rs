@@ -2,7 +2,6 @@ use crate::database::Database;
 use crate::models::alerts::AlertHistory;
 use reqwest::Client;
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
 
 pub struct AlertManager {
     db: Arc<Database>,
@@ -10,6 +9,7 @@ pub struct AlertManager {
 }
 
 impl AlertManager {
+    #[must_use]
     pub fn new(db: Arc<Database>) -> Self {
         Self {
             db,
@@ -54,16 +54,19 @@ impl AlertManager {
                     );
 
                     // 1. Save to History
-                    let history = self.db.insert_alert_history(
-                        &rule.id,
-                        &rule.user_id,
-                        Some(corridor_id.to_string()),
-                        &rule.metric_type,
-                        current_value,
-                        rule.threshold,
-                        &rule.condition,
-                        &message,
-                    ).await?;
+                    let history = self
+                        .db
+                        .insert_alert_history(
+                            &rule.id,
+                            &rule.user_id,
+                            Some(corridor_id.to_string()),
+                            &rule.metric_type,
+                            current_value,
+                            rule.threshold,
+                            &rule.condition,
+                            &message,
+                        )
+                        .await?;
 
                     // 2. Transmit via requested channels
                     if rule.notify_email {
@@ -84,12 +87,20 @@ impl AlertManager {
     }
 
     async fn send_email_alert(&self, user_id: &str, message: &str) {
-        // Mocking email dispatcher for brevity 
-        tracing::info!("Sending EMAIL alert to user {}: {}", user_id, message);
+        // Mocking email dispatcher for brevity
+        tracing::info!(
+            user_id = crate::logging::redaction::redact_user_id(user_id),
+            message_len = message.len(),
+            "Sending EMAIL alert to user"
+        );
     }
 
     async fn send_webhook_alert(&self, user_id: &str, history: &AlertHistory) {
         // Mocking webhook dispatcher for brevity
-        tracing::info!("Sending WEBHOOK alert to user {}", user_id);
+        tracing::info!(
+            user_id = crate::logging::redaction::redact_user_id(user_id),
+            alert_type = ?history.metric_type,
+            "Sending WEBHOOK alert to user"
+        );
     }
 }

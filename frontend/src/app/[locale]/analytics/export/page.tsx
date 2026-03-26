@@ -2,7 +2,7 @@
 
 import React, { useState, useMemo } from "react";
 import { MainLayout } from "@/components/layout";
-import { ArrowLeft, Download, FileJson, FileText, Mail } from "lucide-react";
+import { ArrowLeft, Download, FileText, Mail } from "lucide-react";
 import { Link } from "@/i18n/navigation";
 import { DateRangeSelector } from "./components/DateRangeSelector";
 import { MetricSelector, MetricOption } from "./components/MetricSelector";
@@ -62,7 +62,7 @@ export default function ExportPage() {
   const getActiveColumns = () =>
     metrics.filter((m) => m.checked).map((m) => ({ id: m.id, label: m.label }));
 
-  const handleExport = (format: "csv" | "json" | "pdf") => {
+  const handleExport = async (format: "csv" | "json" | "pdf") => {
     const columns = getActiveColumns();
     if (columns.length === 0) {
       alert("Please select at least one metric to export.");
@@ -77,7 +77,7 @@ export default function ExportPage() {
         generateJSON(previewData, columns);
         break;
       case "pdf":
-        generatePDF(previewData, columns, { start: startDate, end: endDate });
+        await generatePDF(previewData, columns, { start: startDate, end: endDate });
         break;
     }
   };
@@ -138,7 +138,7 @@ export default function ExportPage() {
                   onClick={() => handleExport("json")}
                   className="flex items-center justify-center gap-2 w-full py-2.5 px-4 bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-600 rounded-lg hover:bg-gray-50 dark:hover:bg-slate-700 transition font-medium text-sm text-gray-700 dark:text-gray-200"
                 >
-                  <FileJson className="w-4 h-4 text-orange-500" />
+                  <FileText className="w-4 h-4 text-orange-500" />
                   Download JSON
                 </button>
                 <button

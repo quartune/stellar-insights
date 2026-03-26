@@ -1,6 +1,7 @@
+use anyhow::Context;
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -12,8 +13,6 @@ use tokio::sync::RwLock;
 
 use crate::models::api_key::hash_api_key;
 
-/// Rate limit configuration for an endpoint
-#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Rate limit configuration for an endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitConfig {
@@ -35,17 +34,15 @@ pub struct ClientRateLimits {
 }
 
 impl Default for RateLimitConfig {
-    impl Default for RateLimitConfig {
-        fn default() -> Self {
-            Self {
-                requests_per_minute: 100,
-                whitelist_ips: vec![],
-                client_limits: Some(ClientRateLimits {
-                    authenticated: 200,
-                    premium: 1000,
-                    anonymous: 60,
-                }),
-            }
+    fn default() -> Self {
+        Self {
+            requests_per_minute: 100,
+            whitelist_ips: vec![],
+            client_limits: Some(ClientRateLimits {
+                authenticated: 200,
+                premium: 1000,
+                anonymous: 60,
+            }),
         }
     }
 }
@@ -63,20 +60,22 @@ pub enum ClientIdentifier {
 
 impl ClientIdentifier {
     /// Get the tier for this client type
-    pub fn tier(&self) -> ClientTier {
+    #[must_use]
+    pub const fn tier(&self) -> ClientTier {
         match self {
-            ClientIdentifier::ApiKey(_) => ClientTier::Authenticated,
-            ClientIdentifier::User(_) => ClientTier::Authenticated,
-            ClientIdentifier::IpAddress(_) => ClientTier::Anonymous,
+            Self::ApiKey(_) => ClientTier::Authenticated,
+            Self::User(_) => ClientTier::Authenticated,
+            Self::IpAddress(_) => ClientTier::Anonymous,
         }
     }
 
     /// Get the identifier string for rate limit key
+    #[must_use]
     pub fn as_key(&self) -> String {
         match self {
-            ClientIdentifier::ApiKey(key) => format!("apikey:{}", key),
-            ClientIdentifier::User(id) => format!("user:{}", id),
-            ClientIdentifier::IpAddress(ip) => format!("ip:{}", ip),
+            Self::ApiKey(key) => format!("apikey:{key}"),
+            Self::User(id) => format!("user:{id}"),
+            Self::IpAddress(ip) => format!("ip:{ip}"),
         }
     }
 }
@@ -138,40 +137,35 @@ impl RateLimiter {
         self.endpoint_configs.write().await.insert(path, config);
     }
 
-    /// Extract client identifier from request
-    async fn extract_client_identifier(&self, req: &Request) -> ClientIdentifier {
+    /// Resolve client identifier from extracted request context.
+    async fn resolve_client_identifier(
+        &self,
+        bearer_token: Option<String>,
+        auth_user_id: Option<String>,
+        ip_address: String,
+    ) -> ClientIdentifier {
         // Try to extract API key from Authorization header
-        if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
-            if let Ok(auth_str) = auth_header.to_str() {
-                // Check for API key format: "Bearer si_live_..."
-                if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                    if token.starts_with("si_live_") || token.starts_with("si_test_") {
-                        // Validate API key against database if available
-                        if let Some(pool) = &self.db_pool {
-                            let key_hash = hash_api_key(token);
-                            if let Ok(Some(api_key)) = self.get_api_key_by_hash(pool, &key_hash).await {
-                                // Update last_used_at timestamp
-                                let _ = self.update_api_key_last_used(pool, &api_key.id).await;
-                                return ClientIdentifier::ApiKey(api_key.id);
-                            }
-                        }
+        if let Some(token) = bearer_token {
+            if token.starts_with("si_live_") || token.starts_with("si_test_") {
+                // Validate API key against database if available
+                if let Some(pool) = &self.db_pool {
+                    let key_hash = hash_api_key(&token);
+                    if let Ok(Some(api_key)) = self.get_api_key_by_hash(pool, &key_hash).await {
+                        // Update last_used_at timestamp
+                        let _ = self.update_api_key_last_used(pool, &api_key.id).await;
+                        return ClientIdentifier::ApiKey(api_key.id);
                     }
                 }
             }
         }
 
         // Try to extract authenticated user from extensions (set by auth middleware)
-        if let Some(auth_user) = req.extensions().get::<crate::auth_middleware::AuthUser>() {
-            return ClientIdentifier::User(auth_user.user_id.clone());
+        if let Some(user_id) = auth_user_id {
+            return ClientIdentifier::User(user_id);
         }
 
         // Fall back to IP address
-        if let Some(connect_info) = req.extensions().get::<ConnectInfo<std::net::SocketAddr>>() {
-            return ClientIdentifier::IpAddress(connect_info.0.ip().to_string());
-        }
-
-        // Default fallback
-        ClientIdentifier::IpAddress("unknown".to_string())
+        ClientIdentifier::IpAddress(ip_address)
     }
 
     /// Get API key from database by hash
@@ -188,7 +182,7 @@ impl RateLimiter {
         .await
     }
 
-    /// Update API key last_used_at timestamp
+    /// Update API key `last_used_at` timestamp
     async fn update_api_key_last_used(
         &self,
         pool: &sqlx::SqlitePool,
@@ -213,7 +207,7 @@ impl RateLimiter {
     }
 
     /// Get rate limit for client based on tier
-    fn get_limit_for_client(&self, config: &RateLimitConfig, tier: ClientTier) -> u32 {
+    const fn get_limit_for_client(&self, config: &RateLimitConfig, tier: ClientTier) -> u32 {
         if let Some(client_limits) = &config.client_limits {
             match tier {
                 ClientTier::Anonymous => client_limits.anonymous,
@@ -251,7 +245,13 @@ impl RateLimiter {
                 RateLimitInfo {
                     limit: config.requests_per_minute,
                     remaining: config.requests_per_minute,
-                    reset_after: 60,
+                    reset_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
+                        + 60,
+                    reset_after_seconds: 60,
+                    window_seconds: 60,
                     is_whitelisted: true,
                     client_id: Some(client.as_key()),
                 },
@@ -267,20 +267,25 @@ impl RateLimiter {
         // Try Redis first
         if let Some(conn) = self.redis_connection.read().await.as_ref() {
             let mut conn = conn.clone();
-            match self.check_redis_limit(&mut conn, &key, limit).await {
-                Ok((allowed, remaining, reset)) => {
-                    return (
-                        allowed,
-                        RateLimitInfo {
-                            limit,
-                            remaining,
-                            reset_after: reset,
-                            is_whitelisted: false,
-                            client_id: Some(client.as_key()),
-                        },
-                    );
-                }
-                Err(_) => {}
+            if let Ok((allowed, remaining, reset)) =
+                self.check_redis_limit(&mut conn, &key, limit).await
+            {
+                return (
+                    allowed,
+                    RateLimitInfo {
+                        limit,
+                        remaining,
+                        reset_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64
+                            + reset as i64,
+                        reset_after_seconds: reset,
+                        window_seconds: 60,
+                        is_whitelisted: false,
+                        client_id: Some(client.as_key()),
+                    },
+                );
             }
         }
 
@@ -291,7 +296,13 @@ impl RateLimiter {
             RateLimitInfo {
                 limit,
                 remaining,
-                reset_after: reset,
+                reset_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+                    + reset as i64,
+                reset_after_seconds: reset,
+                window_seconds: 60,
                 is_whitelisted: false,
                 client_id: Some(client.as_key()),
             },
@@ -301,7 +312,8 @@ impl RateLimiter {
     /// Check rate limit for an IP/endpoint combination (legacy method)
     pub async fn check_rate_limit(&self, ip: &str, endpoint: &str) -> (bool, RateLimitInfo) {
         let client = ClientIdentifier::IpAddress(ip.to_string());
-        self.check_rate_limit_for_client(&client, endpoint, ip).await
+        self.check_rate_limit_for_client(&client, endpoint, ip)
+            .await
     }
 
     /// Check rate limit in Redis
@@ -327,11 +339,7 @@ impl RateLimiter {
             conn.expire::<_, ()>(key, 60).await?;
         }
 
-        let remaining = if new_count >= limit {
-            0
-        } else {
-            limit - new_count
-        };
+        let remaining = limit.saturating_sub(new_count);
         Ok((new_count < limit, remaining, 60))
     }
 
@@ -339,7 +347,7 @@ impl RateLimiter {
     async fn check_memory_limit(&self, key: &str, limit: u32) -> (bool, u32, u32) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
 
         let mut store = self.fallback_memory_store.write().await;
@@ -355,11 +363,7 @@ impl RateLimiter {
         } else {
             let new_count = count + 1;
             store.insert(key.to_string(), (new_count, expiry));
-            let remaining = if new_count >= limit {
-                0
-            } else {
-                limit - new_count
-            };
+            let remaining = limit.saturating_sub(new_count);
             (new_count < limit, remaining, (expiry - now) as u32)
         }
     }
@@ -370,9 +374,66 @@ impl RateLimiter {
 pub struct RateLimitInfo {
     pub limit: u32,
     pub remaining: u32,
-    pub reset_after: u32,
+    pub reset_at: i64,
+    pub reset_after_seconds: u32,
+    pub window_seconds: u32,
     pub is_whitelisted: bool,
     pub client_id: Option<String>,
+}
+
+/// Add rate limit headers to a response according to standards
+pub fn add_rate_limit_headers(
+    mut response: Response,
+    info: &RateLimitInfo,
+) -> anyhow::Result<Response> {
+    // Standard rate limit headers (draft RFC)
+    response.headers_mut().insert(
+        "RateLimit-Limit",
+        HeaderValue::from_str(&info.limit.to_string())
+            .context("Failed to create RateLimit-Limit header")?,
+    );
+
+    response.headers_mut().insert(
+        "RateLimit-Remaining",
+        HeaderValue::from_str(&info.remaining.to_string())
+            .context("Failed to create RateLimit-Remaining header")?,
+    );
+
+    response.headers_mut().insert(
+        "RateLimit-Reset",
+        HeaderValue::from_str(&info.reset_at.to_string())
+            .context("Failed to create RateLimit-Reset header")?,
+    );
+
+    // Add Retry-After when rate limited
+    if info.remaining == 0 {
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_str(&info.reset_after_seconds.to_string())
+                .context("Failed to create Retry-After header")?,
+        );
+    }
+
+    // Add custom header for rate limit policy
+    response.headers_mut().insert(
+        "X-RateLimit-Policy",
+        HeaderValue::from_str(&format!(
+            "{} requests per {} seconds",
+            info.limit, info.window_seconds
+        ))
+        .context("Failed to create X-RateLimit-Policy header")?,
+    );
+
+    // Add optional client identifier for debugging (sanitized)
+    if let Some(client_id) = &info.client_id {
+        if let Ok(header_value) = HeaderValue::from_str(client_id) {
+            response
+                .headers_mut()
+                .insert("X-RateLimit-Client", header_value);
+        }
+    }
+
+    Ok(response)
 }
 
 /// Rate limit error response
@@ -386,62 +447,73 @@ impl IntoResponse for RateLimitError {
         let body = serde_json::json!({
             "error": "Rate limit exceeded",
             "limit": self.info.limit,
-            "reset_after": self.info.reset_after,
+            "reset_after": self.info.reset_after_seconds,
         });
 
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            [
-                ("RateLimit-Limit", self.info.limit.to_string()),
-                ("RateLimit-Remaining", self.info.remaining.to_string()),
-                ("RateLimit-Reset", self.info.reset_after.to_string()),
-            ],
-            axum::Json(body),
-        )
-            .into_response()
+        let response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+
+        match add_rate_limit_headers(response, &self.info) {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::error!("Failed to add rate limit headers to error response: {}", e);
+                // Return basic error response if header addition fails
+                (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response()
+            }
+        }
     }
 }
 
 /// Middleware for rate limiting
 pub async fn rate_limit_middleware(
     State(limiter): State<Arc<RateLimiter>>,
-    addr: ConnectInfo<std::net::SocketAddr>,
     req: Request,
     next: Next,
 ) -> Response {
-    let ip = addr.0.ip().to_string();
+    let bearer_token = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|auth_str| auth_str.strip_prefix("Bearer "))
+        .map(str::to_owned);
+
+    let auth_user_id = req
+        .extensions()
+        .get::<crate::auth_middleware::AuthUser>()
+        .map(|auth_user| auth_user.user_id.clone());
+
+    let ip = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map_or_else(
+            || "unknown".to_string(),
+            |connect_info| connect_info.0.ip().to_string(),
+        );
     let path = req.uri().path().to_string();
 
-    // Extract client identifier from request
-    let client = limiter.extract_client_identifier(&req).await;
+    // Resolve client identifier from copied request metadata.
+    let client = limiter
+        .resolve_client_identifier(bearer_token, auth_user_id, ip.clone())
+        .await;
 
-    let (allowed, info) = limiter.check_rate_limit_for_client(&client, &path, &ip).await;
+    let (allowed, info) = limiter
+        .check_rate_limit_for_client(&client, &path, &ip)
+        .await;
 
     if !allowed {
         return RateLimitError { info }.into_response();
     }
 
     let mut response = next.run(req).await;
-    
-    // Add rate limit headers
-    response
-        .headers_mut()
-        .insert("RateLimit-Limit", info.limit.to_string().parse().unwrap());
-    response.headers_mut().insert(
-        "RateLimit-Remaining",
-        info.remaining.to_string().parse().unwrap(),
-    );
-    response.headers_mut().insert(
-        "RateLimit-Reset",
-        info.reset_after.to_string().parse().unwrap(),
-    );
-    
-    // Optionally add client identifier for debugging (sanitized)
-    if let Some(client_id) = &info.client_id {
-        if let Ok(header_value) = client_id.parse() {
-            response.headers_mut().insert("X-RateLimit-Client", header_value);
+
+    match add_rate_limit_headers(response, &info) {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::error!("Failed to add rate limit headers: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to add rate limit headers",
+            )
+                .into_response()
         }
     }
-
-    response
 }

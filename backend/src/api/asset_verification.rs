@@ -52,23 +52,38 @@ async fn verify_asset(
         ));
     }
 
-    let verifier = AssetVerifier::new((**pool).clone())
-        .map_err(|e| {
-            tracing::error!("Failed to create asset verifier: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": "Internal server error",
-                    "message": "Failed to initialize verification service"
-                })),
-            )
-        })?;
+    let verifier = AssetVerifier::new(pool.as_ref().clone()).map_err(|e| {
+        tracing::error!("Failed to create asset verifier: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Internal server error",
+                "message": "Failed to initialize verification service"
+            })),
+        )
+    })?;
 
     match verifier.verify_asset(&code, &issuer).await {
-        Ok(asset) => {
-            let response: VerifiedAssetResponse = asset.into();
-            Ok((StatusCode::OK, Json(response)))
-        }
+        Ok(result) => Ok((
+            StatusCode::OK,
+            Json(json!({
+                "asset_code": code,
+                "asset_issuer": issuer,
+                "verified": result.stellar_expert_verified
+                    || result.stellar_toml_verified
+                    || result.anchor_registry_verified,
+                "trust_indicators": {
+                    "stellar_expert_verified": result.stellar_expert_verified,
+                    "stellar_toml_verified": result.stellar_toml_verified,
+                    "anchor_registry_verified": result.anchor_registry_verified
+                },
+                "metrics": {
+                    "trustline_count": result.trustline_count,
+                    "transaction_count": result.transaction_count,
+                    "total_volume_usd": result.total_volume_usd
+                }
+            })),
+        )),
         Err(e) => {
             tracing::error!("Asset verification failed: {}", e);
             Err((
@@ -109,17 +124,16 @@ async fn get_verification(
         ));
     }
 
-    let verifier = AssetVerifier::new((**pool).clone())
-        .map_err(|e| {
-            tracing::error!("Failed to create asset verifier: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": "Internal server error",
-                    "message": "Failed to initialize verification service"
-                })),
-            )
-        })?;
+    let verifier = AssetVerifier::new(pool.as_ref().clone()).map_err(|e| {
+        tracing::error!("Failed to create asset verifier: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Internal server error",
+                "message": "Failed to initialize verification service"
+            })),
+        )
+    })?;
 
     match verifier.get_verified_asset(&code, &issuer).await {
         Ok(Some(asset)) => {
@@ -147,7 +161,7 @@ async fn get_verification(
 }
 
 /// List verified assets with optional filters
-/// GET /api/assets/verified?status=verified&min_reputation=60&limit=50&offset=0
+/// GET /`api/assets/verified?status=verified&min_reputation=60&limit=50&offset=0`
 async fn list_verified_assets(
     State(pool): State<Arc<SqlitePool>>,
     Query(query): Query<ListVerifiedAssetsQuery>,
@@ -168,26 +182,25 @@ async fn list_verified_assets(
         }
     }
 
-    let verifier = AssetVerifier::new((**pool).clone())
-        .map_err(|e| {
-            tracing::error!("Failed to create asset verifier: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": "Internal server error",
-                    "message": "Failed to initialize verification service"
-                })),
-            )
-        })?;
+    let verifier = AssetVerifier::new(pool.as_ref().clone()).map_err(|e| {
+        tracing::error!("Failed to create asset verifier: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Internal server error",
+                "message": "Failed to initialize verification service"
+            })),
+        )
+    })?;
 
     match verifier
-        .list_verified_assets(query.status.as_ref(), query.min_reputation, limit, offset)
+        .list_verified_assets(query.status.clone(), query.min_reputation, limit, offset)
         .await
     {
         Ok(assets) => {
             let total = assets.len() as i64;
             let responses: Vec<VerifiedAssetResponse> =
-                assets.into_iter().map(|a| a.into()).collect();
+                assets.into_iter().map(std::convert::Into::into).collect();
 
             Ok((
                 StatusCode::OK,
@@ -277,12 +290,12 @@ async fn report_suspicious_asset(
 
     // Insert report into database
     let result = sqlx::query(
-        r#"
+        r"
         INSERT INTO asset_verification_reports (
             id, asset_code, asset_issuer, reporter_account,
             report_type, description, evidence_url, status
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-        "#,
+        ",
     )
     .bind(&report_id)
     .bind(&request.asset_code)
@@ -291,24 +304,24 @@ async fn report_suspicious_asset(
     .bind(request.report_type.as_str())
     .bind(&request.description)
     .bind(&request.evidence_url)
-    .execute(&**pool)
+    .execute(&*pool)
     .await;
 
     match result {
         Ok(_) => {
             // Update suspicious reports count
             let _ = sqlx::query(
-                r#"
+                r"
                 UPDATE verified_assets
                 SET suspicious_reports_count = suspicious_reports_count + 1,
                     last_suspicious_report_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE asset_code = ? AND asset_issuer = ?
-                "#,
+                ",
             )
             .bind(&request.asset_code)
             .bind(&request.asset_issuer)
-            .execute(&**pool)
+            .execute(&*pool)
             .await;
 
             Ok((

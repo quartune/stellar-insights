@@ -3,7 +3,6 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{ConnectOptions, SqlitePool};
-use std::str::FromStr;
 use std::time::Duration;
 use std::time::Instant;
 use uuid::Uuid;
@@ -46,7 +45,7 @@ pub struct SqlLogConfig {
     pub level: log::LevelFilter,
     /// In development: log all queries. In production: log only slow queries.
     pub log_all_in_dev: bool,
-    /// Slow query threshold (ms); only used when log_all_in_dev is false.
+    /// Slow query threshold (ms); only used when `log_all_in_dev` is false.
     pub slow_query_threshold_ms: u64,
 }
 
@@ -62,9 +61,10 @@ impl Default for SqlLogConfig {
 
 impl SqlLogConfig {
     /// Load from environment:
-    /// - RUST_ENV or ENVIRONMENT: "development" => log all queries, else log only slow
-    /// - DB_LOG_LEVEL: trace | debug | info | warn | error | off (default: debug in dev, info in prod)
-    /// - DB_SLOW_QUERY_MS: threshold in ms for slow query logging in production (default: 100)
+    /// - `RUST_ENV` or ENVIRONMENT: "development" => log all queries, else log only slow
+    /// - `DB_LOG_LEVEL`: trace | debug | info | warn | error | off (default: debug in dev, info in prod)
+    /// - `DB_SLOW_QUERY_MS`: threshold in ms for slow query logging in production (default: 100)
+    #[must_use]
     pub fn from_env() -> Self {
         let env_mode = std::env::var("RUST_ENV")
             .or_else(|_| std::env::var("ENVIRONMENT"))
@@ -105,6 +105,7 @@ fn parse_db_log_level(is_dev: bool) -> log::LevelFilter {
 
 impl PoolConfig {
     /// Load pool configuration from environment variables
+    #[must_use]
     pub fn from_env() -> Self {
         Self {
             max_connections: std::env::var("DB_POOL_MAX_CONNECTIONS")
@@ -130,14 +131,14 @@ impl PoolConfig {
         }
     }
 
-    /// Create a configured SQLite pool with these settings.
+    /// Create a configured `SQLite` pool with these settings.
     /// Uses WAL journal mode and configurable SQL query logging (all in dev, slow-only in prod).
     pub async fn create_pool(&self, database_url: &str) -> Result<SqlitePool> {
         let sql_log = SqlLogConfig::from_env();
 
         let mut opts: SqliteConnectOptions = database_url
             .parse()
-            .map_err(|e: sqlx::Error| anyhow::anyhow!("Invalid DATABASE_URL: {}", e))?;
+            .map_err(|e: sqlx::Error| anyhow::anyhow!("Invalid DATABASE_URL: {e}"))?;
 
         opts = opts.journal_mode(SqliteJournalMode::Wal);
 
@@ -184,6 +185,17 @@ pub struct AnchorRpcUpdate {
     pub status: String,
 }
 
+/// Parameters for updating anchor metrics
+#[derive(Debug, Clone)]
+pub struct AnchorMetricsUpdate {
+    pub anchor_id: Uuid,
+    pub total_transactions: i64,
+    pub successful_transactions: i64,
+    pub failed_transactions: i64,
+    pub avg_settlement_time_ms: Option<i32>,
+    pub volume_usd: Option<f64>,
+}
+
 /// Parameters for recording anchor metrics history
 pub struct AnchorMetricsParams {
     pub anchor_id: Uuid,
@@ -207,26 +219,63 @@ pub struct PoolMetrics {
 pub struct Database {
     pool: SqlitePool,
     pub admin_audit_logger: AdminAuditLogger,
+    /// Threshold in milliseconds above which a query is logged as slow at WARN level.
+    /// Loaded from `SLOW_QUERY_THRESHOLD_MS` (default: 100).
+    slow_query_threshold_ms: u64,
 }
 
 impl Database {
+    #[must_use]
     pub fn new(pool: SqlitePool) -> Self {
         let admin_audit_logger = AdminAuditLogger::new(pool.clone());
+        let slow_query_threshold_ms = std::env::var("SLOW_QUERY_THRESHOLD_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
         Self {
             pool,
             admin_audit_logger,
+            slow_query_threshold_ms,
         }
     }
 
-    pub fn pool(&self) -> &SqlitePool {
+    /// Executes `f`, records its duration via `observe_db_query`, and emits a WARN log
+    /// if the duration exceeds `slow_query_threshold_ms`.
+    async fn execute_with_timing<T, F>(&self, operation: &str, f: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        let start = Instant::now();
+        let result = f.await;
+        let elapsed = start.elapsed();
+        let status = if result.is_ok() { "success" } else { "error" };
+
+        if elapsed.as_millis() as u64 > self.slow_query_threshold_ms {
+            log::warn!(
+                "Slow query detected: '{}' took {}ms (threshold: {}ms)",
+                operation,
+                elapsed.as_millis(),
+                self.slow_query_threshold_ms,
+            );
+        }
+
+        crate::observability::metrics::observe_db_query(operation, status, elapsed.as_secs_f64());
+
+        result
+    }
+
+    #[must_use]
+    pub const fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
+    #[must_use]
     pub fn corridor_aggregates(&self) -> crate::db::aggregates::CorridorAggregates {
         crate::db::aggregates::CorridorAggregates::new(self.pool.clone())
     }
 
     /// Get connection pool metrics
+    #[must_use]
     pub fn pool_metrics(&self) -> PoolMetrics {
         PoolMetrics {
             size: self.pool.size(),
@@ -235,96 +284,220 @@ impl Database {
     }
 
     // Anchor operations
+
+    /// Creates a new anchor in the database.
+    ///
+    /// # Arguments
+    ///
+    /// * `req` - Anchor creation request containing name, `stellar_account`, and `home_domain`
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Anchor)` - Newly created anchor with generated UUID
+    /// * `Err(_)` - Database insertion failed
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let req = CreateAnchorRequest {
+    ///     name: "Example Anchor".to_string(),
+    ///     stellar_account: "GBRPYHIL...".to_string(),
+    ///     home_domain: Some("example.com".to_string()),
+    /// };
+    /// let anchor = db.create_anchor(req).await?;
+    /// ```
     pub async fn create_anchor(&self, req: CreateAnchorRequest) -> Result<Anchor> {
-        let id = Uuid::new_v4().to_string();
-        let anchor = sqlx::query_as::<_, Anchor>(
-            r#"
+        self.execute_with_timing("create_anchor", async {
+            let id = Uuid::new_v4().to_string();
+            let anchor = sqlx::query_as::<_, Anchor>(
+                r"
             INSERT INTO anchors (id, name, stellar_account, home_domain)
             VALUES ($1, $2, $3, $4)
             RETURNING *
-            "#,
-        )
-        .bind(id)
-        .bind(&req.name)
-        .bind(&req.stellar_account)
-        .bind(&req.home_domain)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(anchor)
+            ",
+            )
+            .bind(id)
+            .bind(&req.name)
+            .bind(&req.stellar_account)
+            .bind(&req.home_domain)
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(anchor)
+        })
+        .await
     }
 
+    /// Retrieves an anchor by its unique identifier.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The UUID of the anchor to retrieve
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(Anchor))` - Anchor found and returned
+    /// * `Ok(None)` - No anchor exists with the given ID
+    /// * `Err(_)` - Database query failed
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let anchor_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
+    /// let anchor = db.get_anchor_by_id(anchor_id).await?;
+    ///
+    /// match anchor {
+    ///     Some(a) => println!("Found anchor: {}", a.name),
+    ///     None => println!("Anchor not found"),
+    /// }
+    /// ```
+    ///
+    /// # Performance
+    ///
+    /// Indexed query on primary key, typically <1ms.
     pub async fn get_anchor_by_id(&self, id: Uuid) -> Result<Option<Anchor>> {
-        let anchor = sqlx::query_as::<_, Anchor>(
-            r#"
+        self.execute_with_timing("get_anchor_by_id", async {
+            let anchor = sqlx::query_as::<_, Anchor>(
+                r"
             SELECT * FROM anchors WHERE id = $1
-            "#,
-        )
-        .bind(id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(anchor)
+            ",
+            )
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+            Ok(anchor)
+        })
+        .await
     }
 
+    /// Retrieves an anchor by its Stellar account address.
+    ///
+    /// # Arguments
+    ///
+    /// * `stellar_account` - The Stellar public key (G-address) of the anchor
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(Anchor))` - Anchor found with this account
+    /// * `Ok(None)` - No anchor exists with this account
+    /// * `Err(_)` - Database query failed
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let account = "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H";
+    /// let anchor = db.get_anchor_by_stellar_account(account).await?;
+    /// ```
     pub async fn get_anchor_by_stellar_account(
         &self,
         stellar_account: &str,
     ) -> Result<Option<Anchor>> {
-        let anchor = sqlx::query_as::<_, Anchor>(
-            r#"
+        self.execute_with_timing("get_anchor_by_stellar_account", async {
+            let anchor = sqlx::query_as::<_, Anchor>(
+                r"
             SELECT * FROM anchors WHERE stellar_account = $1
-            "#,
-        )
-        .bind(stellar_account)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(anchor)
+            ",
+            )
+            .bind(stellar_account)
+            .fetch_optional(&self.pool)
+            .await?;
+            Ok(anchor)
+        })
+        .await
     }
 
+    /// Lists all anchors with pagination, sorted by reliability score.
+    ///
+    /// # Arguments
+    ///
+    /// * `limit` - Maximum number of anchors to return
+    /// * `offset` - Number of anchors to skip (for pagination)
+    ///
+    /// # Returns
+    ///
+    /// Vector of anchors sorted by `reliability_score` DESC, then `updated_at` DESC.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// // Get first page (10 anchors)
+    /// let anchors = db.list_anchors(10, 0).await?;
+    ///
+    /// // Get second page
+    /// let anchors = db.list_anchors(10, 10).await?;
+    /// ```
+    ///
+    /// # Performance
+    ///
+    /// Query is indexed and metrics are recorded. Typical response time <10ms for limit ≤ 100.
     pub async fn list_anchors(&self, limit: i64, offset: i64) -> Result<Vec<Anchor>> {
-        let start = Instant::now();
-        let anchors = sqlx::query_as::<_, Anchor>(
-            r#"
+        self.execute_with_timing("list_anchors", async {
+            let anchors = sqlx::query_as::<_, Anchor>(
+                r"
             SELECT * FROM anchors
             ORDER BY reliability_score DESC, updated_at DESC
             LIMIT $1 OFFSET $2
-            "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
-
-        crate::observability::metrics::observe_db_query(
-            "list_anchors",
-            "success",
-            start.elapsed().as_secs_f64(),
-        );
-        Ok(anchors)
+            ",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+            Ok(anchors)
+        })
+        .await
     }
 
-    pub async fn update_anchor_metrics(
-        &self,
-        anchor_id: Uuid,
-        total_transactions: i64,
-        successful_transactions: i64,
-        failed_transactions: i64,
-        avg_settlement_time_ms: Option<i32>,
-        volume_usd: Option<f64>,
-    ) -> Result<Anchor> {
+    /// Updates anchor metrics and records history.
+    ///
+    /// Computes reliability score and status from transaction metrics, updates the anchor,
+    /// and records a history entry for trend analysis.
+    ///
+    /// # Arguments
+    ///
+    /// * `anchor_id` - UUID of the anchor to update
+    /// * `total_transactions` - Total number of transactions processed
+    /// * `successful_transactions` - Number of successful transactions
+    /// * `failed_transactions` - Number of failed transactions
+    /// * `avg_settlement_time_ms` - Average settlement time in milliseconds (optional)
+    /// * `volume_usd` - Total volume in USD (optional, preserves existing if None)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Anchor)` - Updated anchor with new metrics
+    /// * `Err(_)` - Database update failed or anchor not found
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let updated = db.update_anchor_metrics(
+    ///     anchor_id,
+    ///     1000,  // total
+    ///     980,   // successful
+    ///     20,    // failed
+    ///     Some(2500),  // avg settlement time
+    ///     Some(1_000_000.0),  // volume
+    /// ).await?;
+    ///
+    /// println!("New reliability score: {}", updated.reliability_score);
+    /// ```
+    ///
+    /// # Side Effects
+    ///
+    /// - Updates anchor's `updated_at` timestamp
+    /// - Records entry in `anchor_metrics_history` table
+    /// - Computes and updates `reliability_score` and status
+    pub async fn update_anchor_metrics(&self, update: AnchorMetricsUpdate) -> Result<Anchor> {
         // Compute metrics
         let metrics = compute_anchor_metrics(
-            total_transactions,
-            successful_transactions,
-            failed_transactions,
-            avg_settlement_time_ms,
+            update.total_transactions,
+            update.successful_transactions,
+            update.failed_transactions,
+            update.avg_settlement_time_ms,
         );
 
         // Update anchor
         let anchor = sqlx::query_as::<_, Anchor>(
-            r#"
+            r"
             UPDATE anchors
             SET total_transactions = $1,
                 successful_transactions = $2,
@@ -336,31 +509,31 @@ impl Database {
                 updated_at = $8
             WHERE id = $9
             RETURNING *
-            "#,
+            ",
         )
-        .bind(total_transactions)
-        .bind(successful_transactions)
-        .bind(failed_transactions)
-        .bind(avg_settlement_time_ms.unwrap_or(0))
+        .bind(update.total_transactions)
+        .bind(update.successful_transactions)
+        .bind(update.failed_transactions)
+        .bind(update.avg_settlement_time_ms.unwrap_or(0))
         .bind(metrics.reliability_score)
         .bind(metrics.status.as_str())
-        .bind(volume_usd.unwrap_or(0.0))
+        .bind(update.volume_usd.unwrap_or(0.0))
         .bind(Utc::now())
-        .bind(anchor_id.to_string())
+        .bind(update.anchor_id.to_string())
         .fetch_one(&self.pool)
         .await?;
 
         // Record metrics history
         self.record_anchor_metrics_history(AnchorMetricsParams {
-            anchor_id,
+            anchor_id: update.anchor_id,
             success_rate: metrics.success_rate,
             failure_rate: metrics.failure_rate,
             reliability_score: metrics.reliability_score,
-            total_transactions,
-            successful_transactions,
-            failed_transactions,
-            avg_settlement_time_ms,
-            volume_usd,
+            total_transactions: update.total_transactions,
+            successful_transactions: update.successful_transactions,
+            failed_transactions: update.failed_transactions,
+            avg_settlement_time_ms: update.avg_settlement_time_ms,
+            volume_usd: update.volume_usd,
         })
         .await?;
 
@@ -368,47 +541,141 @@ impl Database {
     }
 
     // Asset operations
+
+    /// Creates a new asset or updates existing asset's anchor association.
+    ///
+    /// Uses UPSERT logic: if an asset with the same code and issuer exists,
+    /// updates its `anchor_id` and timestamp. Otherwise, creates a new asset.
+    ///
+    /// # Arguments
+    ///
+    /// * `anchor_id` - UUID of the anchor issuing this asset
+    /// * `asset_code` - Asset code (e.g., "USDC", "XLM")
+    /// * `asset_issuer` - Stellar public key of the asset issuer
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Asset)` - Created or updated asset
+    /// * `Err(_)` - Database operation failed
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let asset = db.create_asset(
+    ///     anchor_id,
+    ///     "USDC".to_string(),
+    ///     "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN".to_string(),
+    /// ).await?;
+    /// ```
+    ///
+    /// # Side Effects
+    ///
+    /// - Updates `updated_at` timestamp on conflict
+    /// - May reassign asset to different anchor if already exists
     pub async fn create_asset(
         &self,
         anchor_id: Uuid,
         asset_code: String,
         asset_issuer: String,
     ) -> Result<Asset> {
-        let id = Uuid::new_v4().to_string();
-        let asset = sqlx::query_as::<_, Asset>(
-            r#"
+        self.execute_with_timing("create_asset", async {
+            let id = Uuid::new_v4().to_string();
+            let asset = sqlx::query_as::<_, Asset>(
+                r"
             INSERT INTO assets (id, anchor_id, asset_code, asset_issuer)
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (asset_code, asset_issuer) DO UPDATE
             SET anchor_id = EXCLUDED.anchor_id,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING *
-            "#,
-        )
-        .bind(id)
-        .bind(anchor_id.to_string())
-        .bind(&asset_code)
-        .bind(&asset_issuer)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(asset)
+            ",
+            )
+            .bind(id)
+            .bind(anchor_id.to_string())
+            .bind(&asset_code)
+            .bind(&asset_issuer)
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(asset)
+        })
+        .await
     }
 
+    /// Retrieves all assets issued by a specific anchor.
+    ///
+    /// # Arguments
+    ///
+    /// * `anchor_id` - UUID of the anchor
+    ///
+    /// # Returns
+    ///
+    /// Vector of assets sorted alphabetically by `asset_code`.
+    /// Returns empty vector if anchor has no assets.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let assets = db.get_assets_by_anchor(anchor_id).await?;
+    /// for asset in assets {
+    ///     println!("{}: {}", asset.asset_code, asset.asset_issuer);
+    /// }
+    /// ```
     pub async fn get_assets_by_anchor(&self, anchor_id: Uuid) -> Result<Vec<Asset>> {
-        let assets = sqlx::query_as::<_, Asset>(
-            r#"
+        self.execute_with_timing("get_assets_by_anchor", async {
+            let assets = sqlx::query_as::<_, Asset>(
+                r"
             SELECT * FROM assets WHERE anchor_id = $1
             ORDER BY asset_code ASC
-            "#,
-        )
-        .bind(anchor_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(assets)
+            ",
+            )
+            .bind(anchor_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+            Ok(assets)
+        })
+        .await
     }
 
+    /// Retrieves assets for multiple anchors in a single query.
+    ///
+    /// Returns a `HashMap` mapping `anchor_id` to their list of assets.
+    /// More efficient than calling `get_assets_by_anchor` multiple times.
+    ///
+    /// # Arguments
+    ///
+    /// * `anchor_ids` - Slice of anchor UUIDs to fetch assets for
+    ///
+    /// # Returns
+    ///
+    /// `HashMap` where keys are `anchor_id` strings and values are vectors of assets.
+    /// Anchors with no assets are not included in the map.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let anchor_ids = vec![anchor1_id, anchor2_id, anchor3_id];
+    /// let assets_map = db.get_assets_by_anchors(&anchor_ids).await?;
+    ///
+    /// for (anchor_id, assets) in assets_map {
+    ///     println!("Anchor {} has {} assets", anchor_id, assets.len());
+    /// }
+    /// ```
+    ///
+    /// # Performance
+    ///
+    /// Uses dynamic SQL with IN clause. Efficient for batch operations.
+    /// Get all anchors from the database
+    pub async fn get_all_anchors(&self) -> Result<Vec<Anchor>> {
+        self.execute_with_timing("get_all_anchors", async {
+            let anchors = sqlx::query_as::<_, Anchor>("SELECT * FROM anchors ORDER BY name ASC")
+                .fetch_all(&self.pool)
+                .await?;
+            Ok(anchors)
+        })
+        .await
+    }
+
+    /// Returns empty `HashMap` if `anchor_ids` is empty.
     pub async fn get_assets_by_anchors(
         &self,
         anchor_ids: &[Uuid],
@@ -417,7 +684,10 @@ impl Database {
             return Ok(std::collections::HashMap::new());
         }
 
-        let anchor_id_strs: Vec<String> = anchor_ids.iter().map(|id| id.to_string()).collect();
+        let anchor_id_strs: Vec<String> = anchor_ids
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         let placeholders = anchor_id_strs
             .iter()
             .enumerate()
@@ -426,8 +696,7 @@ impl Database {
             .join(", ");
 
         let query_str = format!(
-            "SELECT * FROM assets WHERE anchor_id IN ({}) ORDER BY anchor_id, asset_code ASC",
-            placeholders
+            "SELECT * FROM assets WHERE anchor_id IN ({placeholders}) ORDER BY anchor_id, asset_code ASC"
         );
 
         let mut query = sqlx::query_as::<_, Asset>(&query_str);
@@ -442,7 +711,7 @@ impl Database {
         for asset in assets {
             result
                 .entry(asset.anchor_id.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(asset);
         }
 
@@ -450,22 +719,25 @@ impl Database {
     }
 
     pub async fn count_assets_by_anchor(&self, anchor_id: Uuid) -> Result<i64> {
-        let count: (i64,) = sqlx::query_as(
-            r#"
+        self.execute_with_timing("count_assets_by_anchor", async {
+            let count: (i64,) = sqlx::query_as(
+                r"
             SELECT COUNT(*) FROM assets WHERE anchor_id = $1
-            "#,
-        )
-        .bind(anchor_id.to_string())
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(count.0)
+            ",
+            )
+            .bind(anchor_id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(count.0)
+        })
+        .await
     }
 
     // Update anchor metrics from RPC ingestion
     pub async fn update_anchor_from_rpc(&self, params: AnchorRpcUpdate) -> Result<()> {
-        sqlx::query(
-            r#"
+        self.execute_with_timing("update_anchor_from_rpc", async {
+            sqlx::query(
+                r"
             UPDATE anchors
             SET total_transactions = $1,
                 successful_transactions = $2,
@@ -476,21 +748,22 @@ impl Database {
                 status = $7,
                 updated_at = $8
             WHERE stellar_account = $9
-            "#,
-        )
-        .bind(params.total_transactions)
-        .bind(params.successful_transactions)
-        .bind(params.failed_transactions)
-        .bind(params.total_volume_usd)
-        .bind(params.avg_settlement_time_ms)
-        .bind(params.reliability_score)
-        .bind(&params.status)
-        .bind(Utc::now())
-        .bind(&params.stellar_account)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+            ",
+            )
+            .bind(params.total_transactions)
+            .bind(params.successful_transactions)
+            .bind(params.failed_transactions)
+            .bind(params.total_volume_usd)
+            .bind(params.avg_settlement_time_ms)
+            .bind(params.reliability_score)
+            .bind(&params.status)
+            .bind(Utc::now())
+            .bind(&params.stellar_account)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+        .await
     }
 
     // Metrics history operations
@@ -498,9 +771,10 @@ impl Database {
         &self,
         params: AnchorMetricsParams,
     ) -> Result<AnchorMetricsHistory> {
-        let id = Uuid::new_v4().to_string();
-        let history = sqlx::query_as::<_, AnchorMetricsHistory>(
-            r#"
+        self.execute_with_timing("record_anchor_metrics_history", async {
+            let id = Uuid::new_v4().to_string();
+            let history = sqlx::query_as::<_, AnchorMetricsHistory>(
+                r"
             INSERT INTO anchor_metrics_history (
                 id, anchor_id, timestamp, success_rate, failure_rate, reliability_score,
                 total_transactions, successful_transactions, failed_transactions,
@@ -508,23 +782,24 @@ impl Database {
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING *
-            "#,
-        )
-        .bind(id)
-        .bind(params.anchor_id.to_string())
-        .bind(Utc::now())
-        .bind(params.success_rate)
-        .bind(params.failure_rate)
-        .bind(params.reliability_score)
-        .bind(params.total_transactions)
-        .bind(params.successful_transactions)
-        .bind(params.failed_transactions)
-        .bind(params.avg_settlement_time_ms.unwrap_or(0))
-        .bind(params.volume_usd.unwrap_or(0.0))
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(history)
+            ",
+            )
+            .bind(id)
+            .bind(params.anchor_id.to_string())
+            .bind(Utc::now())
+            .bind(params.success_rate)
+            .bind(params.failure_rate)
+            .bind(params.reliability_score)
+            .bind(params.total_transactions)
+            .bind(params.successful_transactions)
+            .bind(params.failed_transactions)
+            .bind(params.avg_settlement_time_ms.unwrap_or(0))
+            .bind(params.volume_usd.unwrap_or(0.0))
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(history)
+        })
+        .await
     }
 
     pub async fn get_anchor_metrics_history(
@@ -532,20 +807,22 @@ impl Database {
         anchor_id: Uuid,
         limit: i64,
     ) -> Result<Vec<AnchorMetricsHistory>> {
-        let history = sqlx::query_as::<_, AnchorMetricsHistory>(
-            r#"
+        self.execute_with_timing("get_anchor_metrics_history", async {
+            let history = sqlx::query_as::<_, AnchorMetricsHistory>(
+                r"
             SELECT * FROM anchor_metrics_history
             WHERE anchor_id = $1
             ORDER BY timestamp DESC
             LIMIT $2
-            "#,
-        )
-        .bind(anchor_id.to_string())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(history)
+            ",
+            )
+            .bind(anchor_id.to_string())
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+            Ok(history)
+        })
+        .await
     }
 
     pub async fn get_anchor_detail(&self, anchor_id: Uuid) -> Result<Option<AnchorDetailResponse>> {
@@ -569,16 +846,15 @@ impl Database {
         &self,
         req: crate::models::CreateCorridorRequest,
     ) -> Result<crate::models::corridor::Corridor> {
-        let corridor = crate::models::corridor::Corridor::new(
-            req.source_asset_code,
-            req.source_asset_issuer,
-            req.dest_asset_code,
-            req.dest_asset_issuer,
-        );
-
-        // Ensure the corridor exists in the database
-        sqlx::query(
-            r#"
+        self.execute_with_timing("create_corridor", async {
+            let corridor = crate::models::corridor::Corridor::new(
+                req.source_asset_code,
+                req.source_asset_issuer,
+                req.dest_asset_code,
+                req.dest_asset_issuer,
+            );
+            sqlx::query(
+                r"
             INSERT INTO corridors (
                 id, source_asset_code, source_asset_issuer,
                 destination_asset_code, destination_asset_issuer
@@ -586,17 +862,18 @@ impl Database {
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (source_asset_code, source_asset_issuer, destination_asset_code, destination_asset_issuer)
             DO UPDATE SET updated_at = CURRENT_TIMESTAMP
-            "#,
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&corridor.asset_a_code)
-        .bind(&corridor.asset_a_issuer)
-        .bind(&corridor.asset_b_code)
-        .bind(&corridor.asset_b_issuer)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(corridor)
+            ",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&corridor.asset_a_code)
+            .bind(&corridor.asset_a_issuer)
+            .bind(&corridor.asset_b_code)
+            .bind(&corridor.asset_b_issuer)
+            .execute(&self.pool)
+            .await?;
+            Ok(corridor)
+        })
+        .await
     }
 
     pub async fn list_corridors(
@@ -604,57 +881,57 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<crate::models::corridor::Corridor>> {
-        let start = Instant::now();
-        let records = sqlx::query_as::<_, CorridorRecord>(
-            r#"
+        self.execute_with_timing("list_corridors", async {
+            let records = sqlx::query_as::<_, CorridorRecord>(
+                r"
             SELECT * FROM corridors ORDER BY reliability_score DESC LIMIT $1 OFFSET $2
-            "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            ",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
-        let corridors = records
-            .into_iter()
-            .map(|r| {
-                crate::models::corridor::Corridor::new(
-                    r.source_asset_code,
-                    r.source_asset_issuer,
-                    r.destination_asset_code,
-                    r.destination_asset_issuer,
-                )
-            })
-            .collect::<Vec<_>>();
-        crate::observability::metrics::observe_db_query(
-            "list_corridors",
-            "success",
-            start.elapsed().as_secs_f64(),
-        );
-        Ok(corridors)
+            let corridors = records
+                .into_iter()
+                .map(|r| {
+                    crate::models::corridor::Corridor::new(
+                        r.source_asset_code,
+                        r.source_asset_issuer,
+                        r.destination_asset_code,
+                        r.destination_asset_issuer,
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok(corridors)
+        })
+        .await
     }
 
     pub async fn get_corridor_by_id(
         &self,
         id: Uuid,
     ) -> Result<Option<crate::models::corridor::Corridor>> {
-        let record = sqlx::query_as::<_, CorridorRecord>(
-            r#"
+        self.execute_with_timing("get_corridor_by_id", async {
+            let record = sqlx::query_as::<_, CorridorRecord>(
+                r"
             SELECT * FROM corridors WHERE id = $1
-            "#,
-        )
-        .bind(id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(record.map(|r| {
-            crate::models::corridor::Corridor::new(
-                r.source_asset_code,
-                r.source_asset_issuer,
-                r.destination_asset_code,
-                r.destination_asset_issuer,
+            ",
             )
-        }))
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+
+            Ok(record.map(|r| {
+                crate::models::corridor::Corridor::new(
+                    r.source_asset_code,
+                    r.source_asset_issuer,
+                    r.destination_asset_code,
+                    r.destination_asset_issuer,
+                )
+            }))
+        })
+        .await
     }
 
     pub async fn update_corridor_metrics(
@@ -662,26 +939,29 @@ impl Database {
         id: Uuid,
         metrics: crate::models::corridor::CorridorMetrics,
     ) -> Result<crate::models::corridor::Corridor> {
-        let record = sqlx::query_as::<_, CorridorRecord>(
-            r#"
+        self.execute_with_timing("update_corridor_metrics", async {
+            let record = sqlx::query_as::<_, CorridorRecord>(
+                r"
             UPDATE corridors
             SET reliability_score = $1,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = $2
             RETURNING *
-            "#,
-        )
-        .bind(metrics.success_rate)
-        .bind(id.to_string())
-        .fetch_one(&self.pool)
-        .await?;
+            ",
+            )
+            .bind(metrics.success_rate)
+            .bind(id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
 
-        Ok(crate::models::corridor::Corridor::new(
-            record.source_asset_code,
-            record.source_asset_issuer,
-            record.destination_asset_code,
-            record.destination_asset_issuer,
-        ))
+            Ok(crate::models::corridor::Corridor::new(
+                record.source_asset_code,
+                record.source_asset_issuer,
+                record.destination_asset_code,
+                record.destination_asset_issuer,
+            ))
+        })
+        .await
     }
 
     // Generic Metric operations
@@ -692,24 +972,26 @@ impl Database {
         entity_id: Option<String>,
         entity_type: Option<String>,
     ) -> Result<MetricRecord> {
-        let id = Uuid::new_v4().to_string();
-        let metric = sqlx::query_as::<_, MetricRecord>(
-            r#"
+        self.execute_with_timing("record_metric", async {
+            let id = Uuid::new_v4().to_string();
+            let metric = sqlx::query_as::<_, MetricRecord>(
+                r"
             INSERT INTO metrics (id, name, value, entity_id, entity_type, timestamp)
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *
-            "#,
-        )
-        .bind(id)
-        .bind(name)
-        .bind(value)
-        .bind(entity_id)
-        .bind(entity_type)
-        .bind(Utc::now())
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(metric)
+            ",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(value)
+            .bind(entity_id)
+            .bind(entity_type)
+            .bind(Utc::now())
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(metric)
+        })
+        .await
     }
 
     // Snapshot operations
@@ -721,124 +1003,132 @@ impl Database {
         hash: Option<String>,
         epoch: Option<i64>,
     ) -> Result<SnapshotRecord> {
-        let id = Uuid::new_v4().to_string();
-        let snapshot = sqlx::query_as::<_, SnapshotRecord>(
-            r#"
+        self.execute_with_timing("create_snapshot", async {
+            let id = Uuid::new_v4().to_string();
+            let snapshot = sqlx::query_as::<_, SnapshotRecord>(
+                r"
             INSERT INTO snapshots (id, entity_id, entity_type, data, hash, epoch, timestamp)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING *
-            "#,
-        )
-        .bind(id)
-        .bind(entity_id)
-        .bind(entity_type)
-        .bind(data.to_string())
-        .bind(hash)
-        .bind(epoch)
-        .bind(Utc::now())
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(snapshot)
+            ",
+            )
+            .bind(id)
+            .bind(entity_id)
+            .bind(entity_type)
+            .bind(data.to_string())
+            .bind(hash)
+            .bind(epoch)
+            .bind(Utc::now())
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(snapshot)
+        })
+        .await
     }
 
     pub async fn get_snapshot_by_epoch(&self, epoch: i64) -> Result<Option<SnapshotRecord>> {
-        let snapshot = sqlx::query_as::<_, SnapshotRecord>(
-            r#"
+        self.execute_with_timing("get_snapshot_by_epoch", async {
+            let snapshot = sqlx::query_as::<_, SnapshotRecord>(
+                r"
             SELECT * FROM snapshots WHERE epoch = $1 LIMIT 1
-            "#,
-        )
-        .bind(epoch)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(snapshot)
+            ",
+            )
+            .bind(epoch)
+            .fetch_optional(&self.pool)
+            .await?;
+            Ok(snapshot)
+        })
+        .await
     }
 
     pub async fn list_snapshots(&self, limit: i64, offset: i64) -> Result<Vec<SnapshotRecord>> {
-        let snapshots = sqlx::query_as::<_, SnapshotRecord>(
-            r#"
+        self.execute_with_timing("list_snapshots", async {
+            let snapshots = sqlx::query_as::<_, SnapshotRecord>(
+                r"
             SELECT * FROM snapshots
             WHERE epoch IS NOT NULL
             ORDER BY epoch DESC
             LIMIT $1 OFFSET $2
-            "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(snapshots)
+            ",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+            Ok(snapshots)
+        })
+        .await
     }
 
     // Ingestion methods
     pub async fn get_ingestion_cursor(&self, task_name: &str) -> Result<Option<String>> {
-        let state = sqlx::query_as::<_, crate::models::IngestionState>(
-            r#"
+        self.execute_with_timing("get_ingestion_cursor", async {
+            let state = sqlx::query_as::<_, crate::models::IngestionState>(
+                r"
             SELECT * FROM ingestion_state WHERE task_name = $1
-            "#,
-        )
-        .bind(task_name)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(state.map(|s| s.last_cursor))
+            ",
+            )
+            .bind(task_name)
+            .fetch_optional(&self.pool)
+            .await?;
+            Ok(state.map(|s| s.last_cursor))
+        })
+        .await
     }
 
     pub async fn update_ingestion_cursor(&self, task_name: &str, last_cursor: &str) -> Result<()> {
-        sqlx::query(
-            r#"
+        self.execute_with_timing("update_ingestion_cursor", async {
+            sqlx::query(
+                r"
             INSERT INTO ingestion_state (task_name, last_cursor, updated_at)
             VALUES ($1, $2, $3)
             ON CONFLICT (task_name) DO UPDATE SET
                 last_cursor = EXCLUDED.last_cursor,
                 updated_at = EXCLUDED.updated_at
-            "#,
-        )
-        .bind(task_name)
-        .bind(last_cursor)
-        .bind(Utc::now())
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+            ",
+            )
+            .bind(task_name)
+            .bind(last_cursor)
+            .bind(Utc::now())
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn save_payments(&self, payments: Vec<crate::models::PaymentRecord>) -> Result<()> {
-        let start = Instant::now();
-        for payment in payments {
-            sqlx::query(
-                r#"
+        self.execute_with_timing("save_payments", async {
+            for payment in payments {
+                sqlx::query(
+                    r"
                 INSERT INTO payments (
                     id, transaction_hash, source_account, destination_account,
                     asset_type, asset_code, asset_issuer, amount, created_at
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (id) DO NOTHING
-                "#,
-            )
-            .bind(&payment.id)
-            .bind(&payment.transaction_hash)
-            .bind(&payment.source_account)
-            .bind(&payment.destination_account)
-            .bind(&payment.asset_type)
-            .bind(&payment.asset_code)
-            .bind(&payment.asset_issuer)
-            .bind(payment.amount)
-            .bind(payment.created_at)
-            .execute(&self.pool)
-            .await?;
-        }
-        crate::observability::metrics::observe_db_query(
-            "save_payments",
-            "success",
-            start.elapsed().as_secs_f64(),
-        );
-        Ok(())
+                ",
+                )
+                .bind(&payment.id)
+                .bind(&payment.transaction_hash)
+                .bind(&payment.source_account)
+                .bind(&payment.destination_account)
+                .bind(&payment.asset_type)
+                .bind(&payment.asset_code)
+                .bind(&payment.asset_issuer)
+                .bind(payment.amount)
+                .bind(payment.created_at)
+                .execute(&self.pool)
+                .await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     // Aggregation methods
+    #[must_use]
     pub fn aggregation_db(&self) -> crate::db::aggregation::AggregationDb {
         crate::db::aggregation::AggregationDb::new(self.pool.clone())
     }
@@ -913,11 +1203,11 @@ impl Database {
         const MUXED_LEN: i64 = 69;
 
         let total_muxed_payments = sqlx::query_scalar::<_, i64>(
-            r#"
+            r"
             SELECT COUNT(*) FROM payments
-            WHERE (source_account LIKE 'M%' AND LENGTH(source_account) = ?1)
-               OR (destination_account LIKE 'M%' AND LENGTH(destination_account) = ?1)
-            "#,
+            WHERE (source_account LIKE 'M%' AND LENGTH(source_account) = $1)
+               OR (destination_account LIKE 'M%' AND LENGTH(destination_account) = $1)
+            ",
         )
         .bind(MUXED_LEN)
         .fetch_one(&self.pool)
@@ -930,13 +1220,13 @@ impl Database {
         }
 
         let source_counts: Vec<AddrCount> = sqlx::query_as(
-            r#"
+            r"
             SELECT source_account AS addr, COUNT(*) AS cnt FROM payments
-            WHERE source_account LIKE 'M%' AND LENGTH(source_account) = ?1
+            WHERE source_account LIKE 'M%' AND LENGTH(source_account) = $1
             GROUP BY source_account
             ORDER BY cnt DESC
-            LIMIT ?2
-            "#,
+            LIMIT $2
+            ",
         )
         .bind(MUXED_LEN)
         .bind(top_limit)
@@ -944,13 +1234,13 @@ impl Database {
         .await?;
 
         let dest_counts: Vec<AddrCount> = sqlx::query_as(
-            r#"
+            r"
             SELECT destination_account AS addr, COUNT(*) AS cnt FROM payments
-            WHERE destination_account LIKE 'M%' AND LENGTH(destination_account) = ?1
+            WHERE destination_account LIKE 'M%' AND LENGTH(destination_account) = $1
             GROUP BY destination_account
             ORDER BY cnt DESC
-            LIMIT ?2
-            "#,
+            LIMIT $2
+            ",
         )
         .bind(MUXED_LEN)
         .bind(top_limit)
@@ -985,13 +1275,13 @@ impl Database {
         top_muxed_by_activity.truncate(top_limit as usize);
 
         let unique_muxed_addresses = sqlx::query_scalar::<_, i64>(
-            r#"
+            r"
             SELECT COUNT(DISTINCT addr) FROM (
-                SELECT source_account AS addr FROM payments WHERE source_account LIKE 'M%' AND LENGTH(source_account) = ?1
+                SELECT source_account AS addr FROM payments WHERE source_account LIKE 'M%' AND LENGTH(source_account) = $1
                 UNION
-                SELECT destination_account AS addr FROM payments WHERE destination_account LIKE 'M%' AND LENGTH(destination_account) = ?1
+                SELECT destination_account AS addr FROM payments WHERE destination_account LIKE 'M%' AND LENGTH(destination_account) = $1
             )
-            "#,
+            ",
         )
         .bind(MUXED_LEN)
         .fetch_one(&self.pool)
@@ -1025,57 +1315,60 @@ impl Database {
         xdr: &str,
         required_signatures: i32,
     ) -> Result<crate::models::PendingTransaction> {
-        let id = Uuid::new_v4().to_string();
-        let status = "pending";
-
-        let tx = sqlx::query_as::<_, crate::models::PendingTransaction>(
-            r#"
+        self.execute_with_timing("create_pending_transaction", async {
+            let id = Uuid::new_v4().to_string();
+            let pending_transaction = sqlx::query_as::<_, crate::models::PendingTransaction>(
+                r"
             INSERT INTO pending_transactions (id, source_account, xdr, required_signatures, status)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING *
-            "#,
-        )
-        .bind(&id)
-        .bind(source_account)
-        .bind(xdr)
-        .bind(required_signatures)
-        .bind(status)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(tx)
+            ",
+            )
+            .bind(&id)
+            .bind(source_account)
+            .bind(xdr)
+            .bind(required_signatures)
+            .bind("pending")
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(pending_transaction)
+        })
+        .await
     }
 
     pub async fn get_pending_transaction(
         &self,
         id: &str,
     ) -> Result<Option<crate::models::PendingTransactionWithSignatures>> {
-        let tx = sqlx::query_as::<_, crate::models::PendingTransaction>(
-            r#"
+        self.execute_with_timing("get_pending_transaction", async {
+            let pending_transaction = sqlx::query_as::<_, crate::models::PendingTransaction>(
+                r"
             SELECT * FROM pending_transactions WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(transaction) = tx {
-            let signatures = sqlx::query_as::<_, crate::models::Signature>(
-                r#"
-                SELECT * FROM transaction_signatures WHERE transaction_id = $1
-                "#,
+            ",
             )
             .bind(id)
-            .fetch_all(&self.pool)
+            .fetch_optional(&self.pool)
             .await?;
 
-            Ok(Some(crate::models::PendingTransactionWithSignatures {
-                transaction,
-                collected_signatures: signatures,
-            }))
-        } else {
-            Ok(None)
-        }
+            if let Some(transaction) = pending_transaction {
+                let signatures = sqlx::query_as::<_, crate::models::Signature>(
+                    r"
+                SELECT * FROM transaction_signatures WHERE transaction_id = $1
+                ",
+                )
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?;
+
+                Ok(Some(crate::models::PendingTransactionWithSignatures {
+                    transaction,
+                    collected_signatures: signatures,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
     }
 
     pub async fn add_transaction_signature(
@@ -1084,38 +1377,41 @@ impl Database {
         signer: &str,
         signature: &str,
     ) -> Result<()> {
-        let id = Uuid::new_v4().to_string();
-
-        sqlx::query(
-            r#"
+        self.execute_with_timing("add_transaction_signature", async {
+            let id = Uuid::new_v4().to_string();
+            sqlx::query(
+                r"
             INSERT INTO transaction_signatures (id, transaction_id, signer, signature)
             VALUES ($1, $2, $3, $4)
-            "#,
-        )
-        .bind(id)
-        .bind(transaction_id)
-        .bind(signer)
-        .bind(signature)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+            ",
+            )
+            .bind(id)
+            .bind(transaction_id)
+            .bind(signer)
+            .bind(signature)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn update_transaction_status(&self, id: &str, status: &str) -> Result<()> {
-        sqlx::query(
-            r#"
+        self.execute_with_timing("update_transaction_status", async {
+            sqlx::query(
+                r"
             UPDATE pending_transactions
             SET status = $1, updated_at = CURRENT_TIMESTAMP
             WHERE id = $2
-            "#,
-        )
-        .bind(status)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+            ",
+            )
+            .bind(status)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+        .await
     }
 
     // API Key operations
@@ -1125,52 +1421,57 @@ impl Database {
         wallet_address: &str,
         req: CreateApiKeyRequest,
     ) -> Result<CreateApiKeyResponse> {
-        let id = Uuid::new_v4().to_string();
-        let (plain_key, prefix, key_hash) = generate_api_key();
-        let scopes = req.scopes.unwrap_or_else(|| "read".to_string());
-        let now = Utc::now().to_rfc3339();
+        self.execute_with_timing("create_api_key", async {
+            let id = Uuid::new_v4().to_string();
+            let (plain_key, prefix, key_hash) = generate_api_key();
+            let scopes = req.scopes.unwrap_or_else(|| "read".to_string());
+            let now = Utc::now().to_rfc3339();
 
-        sqlx::query(
-            r#"
+            sqlx::query(
+                r"
             INSERT INTO api_keys (id, name, key_prefix, key_hash, wallet_address, scopes, status, created_at, expires_at)
             VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8)
-            "#,
-        )
-        .bind(&id)
-        .bind(&req.name)
-        .bind(&prefix)
-        .bind(&key_hash)
-        .bind(wallet_address)
-        .bind(&scopes)
-        .bind(&now)
-        .bind(&req.expires_at)
-        .execute(&self.pool)
-        .await?;
-
-        let key = sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE id = $1")
+            ",
+            )
             .bind(&id)
-            .fetch_one(&self.pool)
+            .bind(&req.name)
+            .bind(&prefix)
+            .bind(&key_hash)
+            .bind(wallet_address)
+            .bind(&scopes)
+            .bind(&now)
+            .bind(&req.expires_at)
+            .execute(&self.pool)
             .await?;
 
-        Ok(CreateApiKeyResponse {
-            key: ApiKeyInfo::from(key),
-            plain_key,
+            let key = sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE id = $1")
+                .bind(&id)
+                .fetch_one(&self.pool)
+                .await?;
+
+            Ok(CreateApiKeyResponse {
+                key: ApiKeyInfo::from(key),
+                plain_key,
+            })
         })
+        .await
     }
 
     pub async fn list_api_keys(&self, wallet_address: &str) -> Result<Vec<ApiKeyInfo>> {
-        let keys = sqlx::query_as::<_, ApiKey>(
-            r#"
+        self.execute_with_timing("list_api_keys", async {
+            let keys = sqlx::query_as::<_, ApiKey>(
+                r"
             SELECT * FROM api_keys
             WHERE wallet_address = $1
             ORDER BY created_at DESC
-            "#,
-        )
-        .bind(wallet_address)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(keys.into_iter().map(ApiKeyInfo::from).collect())
+            ",
+            )
+            .bind(wallet_address)
+            .fetch_all(&self.pool)
+            .await?;
+            Ok(keys.into_iter().map(ApiKeyInfo::from).collect())
+        })
+        .await
     }
 
     pub async fn get_api_key_by_id(
@@ -1178,61 +1479,85 @@ impl Database {
         id: &str,
         wallet_address: &str,
     ) -> Result<Option<ApiKeyInfo>> {
-        let key = sqlx::query_as::<_, ApiKey>(
-            "SELECT * FROM api_keys WHERE id = $1 AND wallet_address = $2",
-        )
-        .bind(id)
-        .bind(wallet_address)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(key.map(ApiKeyInfo::from))
+        self.execute_with_timing("get_api_key_by_id", async {
+            let key = sqlx::query_as::<_, ApiKey>(
+                "SELECT * FROM api_keys WHERE id = $1 AND wallet_address = $2",
+            )
+            .bind(id)
+            .bind(wallet_address)
+            .fetch_optional(&self.pool)
+            .await?;
+            Ok(key.map(ApiKeyInfo::from))
+        })
+        .await
     }
 
     pub async fn validate_api_key(&self, plain_key: &str) -> Result<Option<ApiKey>> {
-        let key_hash = hash_api_key(plain_key);
+        self.execute_with_timing("validate_api_key", async {
+            let key_hash = hash_api_key(plain_key);
 
-        let key = sqlx::query_as::<_, ApiKey>(
-            "SELECT * FROM api_keys WHERE key_hash = $1 AND status = 'active'",
-        )
-        .bind(&key_hash)
-        .fetch_optional(&self.pool)
-        .await?;
+            let key = sqlx::query_as::<_, ApiKey>(
+                "SELECT * FROM api_keys WHERE key_hash = $1 AND status = 'active'",
+            )
+            .bind(&key_hash)
+            .fetch_optional(&self.pool)
+            .await?;
 
-        if let Some(ref k) = key {
-            if let Some(ref expires_at) = k.expires_at {
-                if let Ok(exp) = DateTime::parse_from_rfc3339(expires_at) {
-                    if exp < Utc::now() {
-                        return Ok(None);
+            if let Some(ref k) = key {
+                if let Some(ref expires_at) = k.expires_at {
+                    match DateTime::parse_from_rfc3339(expires_at) {
+                        Ok(exp) => {
+                            if exp < Utc::now() {
+                                return Ok(None);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "API key {} has malformed expires_at '{}': {}",
+                                k.id,
+                                expires_at,
+                                e
+                            );
+                            return Ok(None);
+                        }
                     }
                 }
             }
 
-            sqlx::query("UPDATE api_keys SET last_used_at = $1 WHERE id = $2")
-                .bind(Utc::now().to_rfc3339())
-                .bind(&k.id)
-                .execute(&self.pool)
-                .await?;
-        }
+            // last_used_at update is best-effort; a failure here should not block validation
+            if let Some(ref k) = key {
+                if let Err(e) = sqlx::query("UPDATE api_keys SET last_used_at = $1 WHERE id = $2")
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(&k.id)
+                    .execute(&self.pool)
+                    .await
+                {
+                    log::warn!("Failed to update last_used_at for API key {}: {}", k.id, e);
+                }
+            }
 
-        Ok(key)
+            Ok(key)
+        })
+        .await
     }
 
     pub async fn revoke_api_key(&self, id: &str, wallet_address: &str) -> Result<bool> {
-        let result = sqlx::query(
-            r#"
+        self.execute_with_timing("revoke_api_key", async {
+            let result = sqlx::query(
+                r"
             UPDATE api_keys
             SET status = 'revoked', revoked_at = $1
             WHERE id = $2 AND wallet_address = $3 AND status = 'active'
-            "#,
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(id)
-        .bind(wallet_address)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected() > 0)
+            ",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .bind(wallet_address)
+            .execute(&self.pool)
+            .await?;
+            Ok(result.rows_affected() > 0)
+        })
+        .await
     }
 
     pub async fn rotate_api_key(

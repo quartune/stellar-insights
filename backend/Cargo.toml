@@ -61,6 +61,7 @@ futures = "0.3"
 tokio-tungstenite = "0.21"
 dashmap = "5.5"
 stellar-xdr = { version = "21.0.0", features = ["std", "curr"] }
+stellar_sdk = "0.1"
 base64 = "0.22"
 jsonwebtoken = "9.2"
 utoipa = { version = "4.2", features = ["axum_extras", "chrono", "uuid"] }
@@ -72,18 +73,16 @@ toml = "0.8"
 prometheus = "0.13"
 md5 = "0.7"
 ipnetwork = "0.20"
-redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
-rand = "0.8"
-urlencoding = "2.1"
-futures = "0.3"
-utoipa = { version = "4.0", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "4", features = ["axum"] }
+argon2 = "0.5.3"
 url = "2.5"
 aes-gcm = "0.10"
 lettre = "0.11"
 hmac = "0.12"
 data-encoding = "2.5"
 lazy_static = "1.4"
+csv = "1.4"
+rust_xlsxwriter = { version = "0.83", features = ["chrono", "serde"] }
+
 
 # [dependencies.stellar-insights-apm]
 # path = "apm"

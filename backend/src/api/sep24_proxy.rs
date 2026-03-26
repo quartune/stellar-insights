@@ -10,10 +10,11 @@ use axum::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Allowed transfer server hosts (env: SEP24_ALLOWED_ORIGINS, comma-separated).
+/// Allowed transfer server hosts (env: `SEP24_ALLOWED_ORIGINS`, comma-separated).
 /// If unset, any origin is allowed (use in dev only).
 fn allowed_origins() -> Vec<String> {
     std::env::var("SEP24_ALLOWED_ORIGINS")
@@ -39,7 +40,14 @@ pub struct Sep24State {
     pub client: Arc<Client>,
 }
 
+impl Default for Sep24State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Sep24State {
+    #[must_use]
     pub fn new() -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -56,7 +64,7 @@ fn base_url(transfer_server: &str) -> String {
     s.to_string()
 }
 
-/// GET /api/sep24/info?transfer_server=<url>
+/// GET /`api/sep24/info?transfer_server`=<url>
 #[derive(Debug, Deserialize)]
 pub struct InfoQuery {
     pub transfer_server: String,
@@ -132,7 +140,7 @@ pub async fn post_deposit_interactive(
 
     let mut req = state.client.post(&url);
     if let Some(jwt) = &body.jwt {
-        req = req.header("Authorization", format!("Bearer {}", jwt));
+        req = req.header("Authorization", format!("Bearer {jwt}"));
     }
     let payload = serde_json::json!({
         "asset_code": body.asset_code,
@@ -203,7 +211,7 @@ pub async fn post_withdraw_interactive(
 
     let mut req = state.client.post(&url);
     if let Some(jwt) = &body.jwt {
-        req = req.header("Authorization", format!("Bearer {}", jwt));
+        req = req.header("Authorization", format!("Bearer {jwt}"));
     }
     let payload = serde_json::json!({
         "asset_code": body.asset_code,
@@ -233,7 +241,7 @@ pub async fn post_withdraw_interactive(
     Ok(Json(data))
 }
 
-/// GET /api/sep24/transactions?transfer_server=&jwt=&...
+/// GET /`api/sep24/transactions?transfer_server=&jwt`=&...
 #[derive(Debug, Deserialize)]
 pub struct TransactionsQuery {
     pub transfer_server: String,
@@ -259,24 +267,24 @@ pub async fn get_transactions(
         ));
     }
     let base = base_url(&q.transfer_server);
-    let mut url = format!("{}/transactions?", base);
+    let mut url = format!("{base}/transactions?");
     if let Some(c) = &q.asset_code {
-        url.push_str(&format!("asset_code={}&", urlencoding::encode(c)));
+        write!(url, "asset_code={}&", urlencoding::encode(c)).unwrap();
     }
     if let Some(k) = &q.kind {
-        url.push_str(&format!("kind={}&", urlencoding::encode(k)));
+        write!(url, "kind={}&", urlencoding::encode(k)).unwrap();
     }
     if let Some(l) = q.limit {
-        url.push_str(&format!("limit={}&", l));
+        write!(url, "limit={l}&").unwrap();
     }
     if let Some(c) = &q.cursor {
-        url.push_str(&format!("cursor={}&", urlencoding::encode(c)));
+        write!(url, "cursor={}&", urlencoding::encode(c)).unwrap();
     }
     let url = url.trim_end_matches('&').trim_end_matches('?');
 
     let mut req = state.client.get(url);
     if let Some(jwt) = &q.jwt {
-        req = req.header("Authorization", format!("Bearer {}", jwt));
+        req = req.header("Authorization", format!("Bearer {jwt}"));
     }
     let resp = req
         .send()
@@ -295,7 +303,7 @@ pub async fn get_transactions(
     Ok(Json(data))
 }
 
-/// GET /api/sep24/transaction?transfer_server=&id=&jwt=
+/// GET /`api/sep24/transaction?transfer_server=&id=&jwt`=
 #[derive(Debug, Deserialize)]
 pub struct TransactionQuery {
     pub transfer_server: String,
@@ -321,7 +329,7 @@ pub async fn get_transaction(
 
     let mut req = state.client.get(&url);
     if let Some(jwt) = &q.jwt {
-        req = req.header("Authorization", format!("Bearer {}", jwt));
+        req = req.header("Authorization", format!("Bearer {jwt}"));
     }
     let resp = req
         .send()
@@ -370,15 +378,15 @@ pub enum Sep24Error {
 impl IntoResponse for Sep24Error {
     fn into_response(self) -> axum::response::Response {
         let (status, body) = match &self {
-            Sep24Error::Forbidden(msg) => (
+            Self::Forbidden(msg) => (
                 StatusCode::FORBIDDEN,
                 serde_json::json!({ "error": "forbidden", "message": msg }),
             ),
-            Sep24Error::Proxy(msg) => (
+            Self::Proxy(msg) => (
                 StatusCode::BAD_GATEWAY,
                 serde_json::json!({ "error": "proxy", "message": msg }),
             ),
-            Sep24Error::Anchor(code, data) => {
+            Self::Anchor(code, data) => {
                 let status = StatusCode::from_u16(*code).unwrap_or(StatusCode::BAD_GATEWAY);
                 (status, data.clone())
             }

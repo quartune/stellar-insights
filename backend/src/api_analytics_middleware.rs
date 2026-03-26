@@ -30,7 +30,7 @@ pub async fn api_analytics_middleware(
     let response = next.run(req).await;
 
     let duration = start.elapsed().as_millis() as i32;
-    let status = response.status().as_u16() as i32;
+    let status = i32::from(response.status().as_u16());
 
     // Save to database asynchronously
     let db_clone = Arc::clone(&db);
@@ -39,7 +39,7 @@ pub async fn api_analytics_middleware(
         let timestamp = Utc::now();
 
         let result = sqlx::query(
-            "INSERT INTO api_usage_stats (id, endpoint, method, status_code, response_time_ms, user_id, timestamp) 
+            "INSERT INTO api_usage_stats (id, endpoint, method, status_code, response_time_ms, user_id, timestamp)
              VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(id)
