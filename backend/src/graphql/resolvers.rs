@@ -1,13 +1,19 @@
+#[cfg(feature = "graphql-deprecated")]
 use async_graphql::*;
+#[cfg(feature = "graphql-deprecated")]
 use sqlx::{QueryBuilder, SqlitePool};
+#[cfg(feature = "graphql-deprecated")]
 use std::sync::Arc;
 
+#[cfg(feature = "graphql-deprecated")]
 use super::types::*;
 
+#[cfg(feature = "graphql-deprecated")]
 pub struct QueryRoot {
     pub pool: Arc<SqlitePool>,
 }
 
+#[cfg(feature = "graphql-deprecated")]
 #[Object]
 impl QueryRoot {
     /// Get a single anchor by ID
@@ -362,10 +368,12 @@ pub struct SearchResults {
     pub corridors: Vec<CorridorType>,
 }
 
+#[cfg(feature = "graphql-deprecated")]
 pub struct MutationRoot {
     pub pool: Arc<SqlitePool>,
 }
 
+#[cfg(feature = "graphql-deprecated")]
 #[Object]
 impl MutationRoot {
     /// Placeholder for future mutations

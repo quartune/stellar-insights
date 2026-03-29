@@ -1,5 +1,8 @@
+#[cfg(feature = "graphql-deprecated")]
 use async_graphql::*;
+#[cfg(feature = "graphql-deprecated")]
 use chrono::{DateTime, Utc};
+#[cfg(feature = "graphql-deprecated")]
 use serde::{Deserialize, Serialize};
 
 /// Anchor entity with metrics

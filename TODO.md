@@ -1,17 +1,22 @@
-# Graceful Shutdown Implementation - PROGRESS TRACKING
+# API Duplication Resolution: Deprecate GraphQL, Make REST Primary
+Status: In Progress | Plan Approved
 
-## Plan Steps (Approved)
+## Step 1: ✅ Add feature flag to backend/Cargo.toml
+- Added `default = []`, `graphql-deprecated = []`.
 
-1. [x] Create TODO.md with breakdown ✅
-2. [x] Update main.rs: Add shutdown start time tracking, final logs ("Server shutdown complete"), use shutdown::wait_for_signal() ✅
-3. [ ] Verify compilation: cd backend && cargo check (running...)
-4. [ ] Test graceful shutdown: cargo run & kill -TERM $!
-5. [x] Run tests: cargo test (shutdown tests pass) ✅
-6. [ ] Mark complete, attempt_completion
+## Step 2: ✅ Guard GraphQL module with cfg 
+- `backend/src/graphql/mod.rs`, `schema.rs`, `resolvers.rs`, `types.rs`: Wrapped with `#[cfg(feature = \"graphql-deprecated\")]`.
 
-## Current Status
+## Step 3: Update documentation.md with guidelines [PENDING]
+- Add \"API Strategy\" section: REST primary.
 
-- Graceful shutdown already 95% implemented
-- Applying final enhancements for 100% match
+## Step 4: Create api_guidelines.md [PENDING]
+- REST use cases doc.
 
-Next: Implement code changes.
+## Step 5: Verify no GraphQL router refs [PENDING]
+- Search main.rs, api/mod.rs.
+
+## Step 6: Test & Complete [PENDING]
+
+**Next Action**: Step 3-4 (docs).
+
