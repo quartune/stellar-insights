@@ -32,6 +32,14 @@ pub enum ContractError {
     SnapshotImmutabilityViolated = 6,
 }
 
+#[contracttype]
+pub struct PauseInfo {
+    pub paused: bool,
+    pub reason: String,
+    pub paused_at: u64,
+    pub paused_by: Address,
+}
+
 fn emit_error_event(
     env: &Env,
     error: ContractError,
@@ -1797,6 +1805,42 @@ impl AnalyticsContract {
                 .unwrap_or(0),
         }
     }
+
+    pub fn pause(env: Env, caller: Address, reason: String) -> Result<(), Error> {
+    caller.require_auth();
+    
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::AdminNotSet)?;
+    
+    if caller != admin {
+        return Err(Error::Unauthorized);
+    }
+    
+    // ✅ Store pause info with reason
+    let pause_info = PauseInfo {
+        paused: true,
+        reason: reason.clone(),
+        paused_at: env.ledger().timestamp(),
+        paused_by: caller.clone(),
+    };
+    
+    env.storage().instance().set(&DataKey::PauseInfo, &pause_info);
+    
+    // Emit event
+    env.events().publish(
+        (symbol_short!("pause"), caller),
+        (reason, env.ledger().timestamp()),
+    );
+    
+    Ok(())
+}
+
+pub fn get_pause_info(env: Env) -> Option<PauseInfo> {
+    env.storage().instance().get(&DataKey::PauseInfo)
+}
 }
 
 #[cfg(test)]
